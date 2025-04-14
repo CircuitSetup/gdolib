@@ -43,27 +43,27 @@ class SecPlus2Reader {
         bool msg_ready = false;
 
         switch (m_mode) {
-            case SCANNING:
-                m_msg_start <<= 8;
-                m_msg_start |= inp;
-                m_msg_start &= 0x00FFFFFF;
+        case SCANNING:
+            m_msg_start <<= 8;
+            m_msg_start |= inp;
+            m_msg_start &= 0x00FFFFFF;
 
-                if (m_msg_start == SECPLUS2_PREAMBLE) {
-                    m_byte_count = 3;
-                    m_mode = RECEIVING;
-                }
-                break;
+            if (m_msg_start == SECPLUS2_PREAMBLE) {
+                m_byte_count = 3;
+                m_mode = RECEIVING;
+            }
+            break;
 
-            case RECEIVING:
-                m_rx_buf[m_byte_count] = inp;
-                m_byte_count += 1;
+        case RECEIVING:
+            m_rx_buf[m_byte_count] = inp;
+            m_byte_count += 1;
 
-                if (m_byte_count == SECPLUS2_CODE_LEN) {
-                    m_mode = SCANNING;
-                    m_msg_start = 0;
-                    msg_ready = true;
-                }
-                break;
+            if (m_byte_count == SECPLUS2_CODE_LEN) {
+                m_mode = SCANNING;
+                m_msg_start = 0;
+                msg_ready = true;
+            }
+            break;
         }
         return msg_ready;
     };
