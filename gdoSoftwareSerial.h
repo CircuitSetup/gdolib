@@ -14,10 +14,8 @@
 extern "C" {
 #endif
 
-extern esp_err_t serial_start(QueueHandle_t rxQueue,
-                              MessageBufferHandle_t *txBuffer,
-                              TaskHandle_t *serialtask, gpio_num_t rxPin,
-                              gpio_num_t txPin);
+extern esp_err_t serial_start(QueueHandle_t rxQueue, MessageBufferHandle_t* txBuffer,
+                              TaskHandle_t* serialtask, gpio_num_t rxPin, gpio_num_t txPin);
 extern esp_err_t serial_stop();
 extern esp_err_t serial_set_protocol(gdo_protocol_type_t protocol);
 
