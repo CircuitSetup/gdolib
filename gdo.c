@@ -82,8 +82,10 @@ static gdo_status_t g_status = {
     .battery = GDO_BATT_STATE_UNKNOWN,
     .learn = GDO_LEARN_STATE_MAX,
     .obstruction = GDO_OBSTRUCTION_STATE_MAX,
-    .paired_devices = {GDO_PAIRED_DEVICE_COUNT_UNKNOWN, GDO_PAIRED_DEVICE_COUNT_UNKNOWN,
-                       GDO_PAIRED_DEVICE_COUNT_UNKNOWN, GDO_PAIRED_DEVICE_COUNT_UNKNOWN,
+    .paired_devices = {GDO_PAIRED_DEVICE_COUNT_UNKNOWN, 
+                       GDO_PAIRED_DEVICE_COUNT_UNKNOWN,
+                       GDO_PAIRED_DEVICE_COUNT_UNKNOWN, 
+                       GDO_PAIRED_DEVICE_COUNT_UNKNOWN,
                        GDO_PAIRED_DEVICE_COUNT_UNKNOWN},
     .synced = false,
     .ttc_enabled = false,
@@ -129,10 +131,9 @@ static TaskHandle_t serial_task_handle;
 /**
  * @brief Initializes the GDO driver.
  * @param config The configuration for the GDO driver.
- * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the config is invalid,
- * ESP_ERR_NO_MEM if memory allocation fails, ESP_ERR_INVALID_STATE if the
- * driver is already initialized.
- */
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the config is invalid, ESP_ERR_NO_MEM if memory allocation fails,
+ * ESP_ERR_INVALID_STATE if the driver is already initialized.
+*/
 esp_err_t gdo_init(const gdo_config_t* config) {
     esp_err_t err = ESP_OK;
 
@@ -440,12 +441,10 @@ done:
 
 /**
  * @brief Starts the GDO driver and the UART.
- * @param event_callback The callback function to be called when an event
- * occurs.
+ * @param event_callback The callback function to be called when an event occurs.
  * @param user_arg optional user argument to be passed to the callback.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails,
- * ESP_ERR_INVALID_STATE if the driver is not initialized.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, ESP_ERR_INVALID_STATE if the driver is not initialized.
+*/
 esp_err_t gdo_start(gdo_event_callback_t event_callback, void* user_arg) {
     esp_err_t err = ESP_OK;
     if (!gdo_tx_queue) { // using this as a proxy for the driver being initialized
