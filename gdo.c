@@ -612,6 +612,29 @@ esp_err_t gdo_door_open(void) {
         return ESP_OK;
     }
 
+    if (g_status.toggle_only) {
+        // If the door is stopped and the last move was opening, then the toggle command will make the door close.
+        // So we need to send a toggle command to stop, then toggle again to open.
+        if (g_status.door == GDO_DOOR_STATE_STOPPED && g_status.last_move_direction == GDO_DOOR_STATE_OPENING) {
+            gdo_sched_cmd_args_t args = {
+                .cmd = (uint32_t)GDO_DOOR_ACTION_TOGGLE,
+                .door_cmd = true,
+            };
+
+            esp_err_t err = schedule_command(&args, 500 * 1000);
+            if (err != ESP_OK) {
+                return err;
+            }
+
+            err = schedule_command(&args, 1000 * 1000);
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
+
+        return gdo_door_toggle();
+    }
+
     return send_door_action(GDO_DOOR_ACTION_OPEN);
 }
 
@@ -625,6 +648,10 @@ esp_err_t gdo_door_close(void) {
     if (g_status.door == GDO_DOOR_STATE_CLOSING || g_status.door == GDO_DOOR_STATE_CLOSED) {
         ESP_LOGI(TAG, "Door already closed or closing, ignore request to close door");
         return ESP_OK;
+    }
+
+    if (g_status.toggle_only) {
+        return gdo_door_toggle();
     }
 
     return send_door_action(GDO_DOOR_ACTION_CLOSE);
@@ -649,6 +676,11 @@ esp_err_t gdo_door_stop(void) {
 esp_err_t gdo_door_toggle(void) {
     if (g_status.ttc_enabled == true)
         gdo_set_time_to_close(g_ttc_delay_s);
+
+    if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
+        return gdo_door_stop();
+    }
+
     return send_door_action(GDO_DOOR_ACTION_TOGGLE);
 }
 
@@ -665,24 +697,22 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_status.door_position < 0 || g_status.close_ms == 0 || g_status.open_ms == 0 ||
-        g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
-        ESP_LOGW(
-            TAG,
-            "Unable to move to target, door position or durations are unknown or door is moving");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    g_status.door_target = target;
-
-    if (g_status.door_target == 0) {
+    if (target == 0) {
         return gdo_door_open();
-    } else if (g_status.door_target == 10000) {
+    }
+ 
+    if (target == 10000) {
         return gdo_door_close();
     }
 
+    if (g_status.door_position < 0 || g_status.close_ms == 0 || g_status.open_ms == 0 ||
+        g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
+        ESP_LOGW(TAG, "Unable to move to target, door position or durations are unknown or door is moving");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     gdo_door_action_t action = GDO_DOOR_ACTION_MAX;
-    int delta = g_status.door_position - g_status.door_target;
+    int delta = g_status.door_position - target;
     float duration_ms = 0.0f;
     if (delta < 0) {
         action = GDO_DOOR_ACTION_CLOSE;
@@ -710,6 +740,9 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
     }
 
     err = send_door_action(action);
+    if (err == ESP_OK) {
+        g_status.door_target = target;
+    }
     return err;
 }
 
@@ -1020,7 +1053,15 @@ esp_err_t gdo_set_min_command_interval(uint32_t ms) {
     return ESP_OK;
 }
 
-/************************************ LOCAL FUNCTIONS *************************************/
+/**
+ * @brief Enables or disables the toggle only mode, may be required by openers that do not have obstruction sensors connected.
+ * @param toggle_only true to enable toggle only mode, false to disable.
+*/
+void gdo_set_toggle_only(bool toggle_only) {
+    g_status.toggle_only = toggle_only;
+}
+
+/************************************ LOCAL FUNCTIONS **************************************/
 
 /**
  * @brief This task stated by `gdo_sync()` to sync the state of the GDO with the controller.
@@ -1042,9 +1083,7 @@ static void gdo_sync_task(void* arg) {
         xQueueReset(gdo_event_queue);
 
         // Delay forever if there is a smart panel connected to allow it to come online and sync before we do anything.
-        ulTaskNotifyTake(pdTRUE, g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL
-                                     ? portMAX_DELAY
-                                     : pdMS_TO_TICKS(2500));
+        ulTaskNotifyTake(pdTRUE, g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL ? portMAX_DELAY : pdMS_TO_TICKS(2500));
 
         if (g_status.door == GDO_DOOR_STATE_UNKNOWN) {
             ESP_LOGW(TAG, "V1 panel not found, trying emulation");
@@ -1070,8 +1109,7 @@ static void gdo_sync_task(void* arg) {
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
 
             if (g_status.door == GDO_DOOR_STATE_UNKNOWN && !g_protocol_forced) {
-                ESP_LOGW(TAG,
-                         "secplus V1 panel emulation failed, trying secplus V2 panel emulation");
+                ESP_LOGW(TAG, "secplus V1 panel emulation failed, trying secplus V2 panel emulation");
                 esp_timer_stop(v1_status_timer);
                 esp_timer_delete(v1_status_timer);
             } else {
@@ -2047,13 +2085,20 @@ static void update_door_state(const gdo_door_state_t door_state) {
                 ESP_LOGE(TAG, "Failed to start door position sync timer");
             }
         }
+
+        if (door_state == GDO_DOOR_STATE_OPENING && g_status.door_target >= g_status.door_position) {
+            g_status.door_target = 0;
+        } else if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door_target <= g_status.door_position) {
+            g_status.door_target = 10000;
+        }
+        
+        g_status.last_move_direction = door_state;
     } else {
         esp_timer_stop(door_position_sync_timer);
 
         if (door_state == GDO_DOOR_STATE_STOPPED) {
-            int delta = g_status.door_position - g_status.door_target;
-            if (delta < -5000 || delta > 5000) {
-                ESP_LOGE(TAG, "Door failed to reach target");
+            if (g_status.door_position < 0) {
+                 ESP_LOGW(TAG, "Unknown door position");
             }
         } else if (door_state == GDO_DOOR_STATE_OPEN) {
             g_status.door_position = 0;
@@ -2064,10 +2109,15 @@ static void update_door_state(const gdo_door_state_t door_state) {
             if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
                 get_openings();
             }
+        } else {
+            ESP_LOGE(TAG, "Unknown door state: %d", door_state);
+            get_status();
+            return;
         }
 
         g_door_start_moving_ms = 0;
         g_status.motor = GDO_MOTOR_STATE_OFF;
+        g_status.door_target = g_status.door_position;
     }
 
     if (g_status.door == GDO_DOOR_STATE_UNKNOWN && g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1 &&

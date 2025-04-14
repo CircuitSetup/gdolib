@@ -161,7 +161,9 @@ typedef struct {
     int32_t door_position;             // Door position in percentage (0-10000) [OPEN-CLOSED]
     int32_t door_target;               // Door target position in percentage (0-10000) [OPEN-CLOSED]
     uint32_t client_id;                // Client ID
-    uint32_t rolling_code;             // Rolling code
+    uint32_t rolling_code;            
+    bool toggle_only;                  // Used when the door opener only supports the toggle command.
+    gdo_door_state_t last_move_direction; // Last move direction
     uint32_t tof_timer_usecs;          // ToF interval timer microseconds use to triger TOF
                                        // events
     uint32_t obst_test_pulse_timer_usecs; // Obstruction test pulse output pin
@@ -193,7 +195,7 @@ typedef struct {
  * @param status The current status of the GDO.
  * @param event The event that occurred.
  * @param user_arg optional user argument to be passed to the callback.
- */
+*/
 typedef void (*gdo_event_callback_t)(const gdo_status_t* status, gdo_cb_event_t event,
                                      void* user_arg);
 
@@ -202,91 +204,81 @@ typedef void (*gdo_event_callback_t)(const gdo_status_t* status, gdo_cb_event_t 
  * @param config The configuration for the GDO driver.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails,
  * ESP_ERR_INVALID_STATE if the driver is not initialized.
- */
+*/
 esp_err_t gdo_init(const gdo_config_t* config);
 
 /**
- * @brief Stops and deletes the GDO driver and resets all state values to
- * defaults.
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the driver is not
- * initialized.
- */
+ * @brief Stops and deletes the GDO driver and resets all state values to defaults.
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the driver is not initialized.
+*/
 esp_err_t gdo_deinit(void);
 
 /**
  * @brief Starts the GDO driver and the UART.
- * @param event_callback The callback function to be called when an event
- * occurs.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, other
- * non-zero errors.
- */
+ * @param event_callback The callback function to be called when an event occurs.
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, other non-zero errors.
+*/
 esp_err_t gdo_start(gdo_event_callback_t event_callback, void* user_arg);
 
 /**
  * @brief Gets the current status of the GDO.
  * @param status a pointer to the status structure to be filled.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if status is NULL.
- * @note This function is perfomred in a critical section and should be called
- * with caution.
- */
+ * @note This function is perfomred in a critical section and should be called with caution.
+*/
 esp_err_t gdo_get_status(gdo_status_t* status);
 
 /**
  * @brief Starts the task that syncs the state of the GDO with the controller.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails,
  * ESP_ERR_NOT_FINISHED if the task is already running.
- */
+*/
 esp_err_t gdo_sync(void);
 
 /**
  * @brief Opens the door.
  * @return ESP_OK on success, other non-zero errors.
- */
+*/
 esp_err_t gdo_door_open(void);
 
 /**
  * @brief Closes the door.
  * @return ESP_OK on success, other non-zero errors.
- */
+*/
 esp_err_t gdo_door_close(void);
 
 /**
  * @brief Stops the door.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_door_stop(void);
 
 /**
  * @brief Toggles the door.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_door_toggle(void);
 
 /**
  * @brief Moves the door to a specific target.
  * @param target The target position to move the door to.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_door_move_to_target(uint32_t target);
 
 /**
  * @brief Turns the light on.
  * @param check if true then query the door status after setting light on.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_light_on();
 esp_err_t gdo_light_on_check(bool check);
 
 /**
  * @brief Turns the light off.
  * @param check if true then query the door status after setting light off.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_light_off();
 esp_err_t gdo_light_off_check(bool check);
 
@@ -294,143 +286,136 @@ esp_err_t gdo_light_off_check(bool check);
  * @brief Toggles the light.
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if current state is unknown,
  * ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
- */
+*/
 esp_err_t gdo_light_toggle(void);
 
 /**
  * @brief Locks the door.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_lock(void);
 
 /**
  * @brief Unlocks the door.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_unlock(void);
 
 /**
  * @brief Toggles the lock.
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if current state is unknown,
  * ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
- */
+*/
 esp_err_t gdo_toggle_lock(void);
 
 /**
  * @brief Activates the learn mode.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_activate_learn(void);
 
 /**
  * @brief Deactivates the learn mode.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_deactivate_learn(void);
 
 /**
  * @brief Clears the paired devices.
  * @param type The type of paired devices to clear.
- * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
- * the encoding fails.
- */
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
+*/
 esp_err_t gdo_clear_paired_devices(gdo_paired_device_type_t type);
 
 /**
  * @brief Get the door state as a string.
  * @param state The door state.
  * @return The door state as a string.
- */
+*/
 const char* gdo_door_state_to_string(gdo_door_state_t state);
 
 /**
  * @brief Get the light state as a string.
  * @param state The light state.
  * @return The light state as a string.
- */
+*/
 const char* gdo_light_state_to_string(gdo_light_state_t state);
 
 /**
  * @brief Get the lock state as a string.
  * @param state The lock state.
  * @return The lock state as a string.
- */
+*/
 const char* gdo_lock_state_to_string(gdo_lock_state_t state);
 
 /**
  * @brief Get the motion state as a string.
  * @param state The motion state.
  * @return The motion state as a string.
- */
+*/
 const char* gdo_motion_state_to_string(gdo_motion_state_t state);
 
 /**
  * @brief Get the obstruction state as a string.
  * @param state The obstruction state.
  * @return The obstruction state as a string.
- */
+*/
 const char* gdo_obstruction_state_to_string(gdo_obstruction_state_t state);
 
 /**
  * @brief Get the motor state as a string.
  * @param state The motor state.
  * @return The motor state as a string.
- */
+*/
 const char* gdo_motor_state_to_string(gdo_motor_state_t state);
 
 /**
  * @brief Get the button state as a string.
  * @param state The button state.
  * @return The button state as a string.
- */
+*/
 const char* gdo_button_state_to_string(gdo_button_state_t state);
 
 /**
  * @brief Get the battery state as a string.
  * @param state The battery state.
  * @return The battery state as a string.
- */
+*/
 const char* gdo_battery_state_to_string(gdo_battery_state_t state);
 
 /**
  * @brief Get the learn state as a string.
  * @param state The learn state.
  * @return The learn state as a string.
- */
+*/
 const char* gdo_learn_state_to_string(gdo_learn_state_t state);
 
 /**
  * @brief Get the paired device type as a string.
  * @param type The paired device type.
  * @return The paired device type as a string.
- */
+*/
 const char* gdo_paired_device_type_to_string(gdo_paired_device_type_t type);
 
 /**
  * @brief Get the protocol type as a string.
  * @param type The protocol type.
  * @return The protocol type as a string.
- */
+*/
 const char* gdo_protocol_type_to_string(gdo_protocol_type_t type);
 
 /**
  * @brief Sets the Security+ V2 rolling code.
  * @param rolling_code The rolling code to set.
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the GDO is already
- * synced.
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the GDO is already synced.
  */
 esp_err_t gdo_set_rolling_code(uint32_t rolling_code);
 
 /**
  * @brief Sets the Security+ V2 client id.
  * @param client_id The client id to set.
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the GDO is already
- * synced.
- */
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the GDO is already synced.
+*/
 esp_err_t gdo_set_client_id(uint32_t client_id);
 
 /**
@@ -438,7 +423,7 @@ esp_err_t gdo_set_client_id(uint32_t client_id);
  * @param protocol The protocol to use.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the protocol is invalid,
  * ESP_ERR_INVALID_STATE if the protocol is already set.
- */
+*/
 esp_err_t gdo_set_protocol(gdo_protocol_type_t protocol);
 
 /**
@@ -446,65 +431,59 @@ esp_err_t gdo_set_protocol(gdo_protocol_type_t protocol);
  * @param time_to_close The time to close value.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the time is invalid,
  * ESP_ERR_INVALID_STATE if the time is out of range.
- */
+*/
 esp_err_t gdo_set_time_to_close(uint16_t time_to_close);
 
 /**
- * @brief Sets the time the door takes to open from fully closed in
- * milliseconds.
+ * @brief Sets the time the door takes to open from fully closed in milliseconds.
  * @param ms The time the door takes to open from fully closed in milliseconds.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the ms is invalid.
- */
+*/
 esp_err_t gdo_set_open_duration(uint16_t ms);
 
 /**
  * @brief Sets the time the door takes to close from fully open in milliseconds.
  * @param ms The time the door takes to close from fully open in milliseconds.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the ms is invalid.
- */
+*/
 esp_err_t gdo_set_close_duration(uint16_t ms);
 
 /**
- * @brief Sets the minimum time in milliseconds to wait between sending
- * consecutive commands.
+ * @brief Sets the minimum time in milliseconds to wait between sending consecutive commands.
  * @param ms The minimum time in milliseconds.
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the time is invalid.
- */
+*/
 esp_err_t gdo_set_min_command_interval(uint32_t ms);
 
 /**
- * @brief Enables or disables the toggle only mode, may be required by openers
- * that do not have obstruction sensors connected.
+ * @brief Enables or disables the toggle only mode, may be required by openers that do not have obstruction sensors connected.
  * @param toggle_only true to enable toggle only mode, false to disable.
- */
+*/
 void gdo_set_toggle_only(bool toggle_only);
 
-/************************************* VEHICLE Functions
- * *****************************************/
+/************************************* VEHICLE Functions ******************************************/
 
 /**
  * @brief Set the user interval timer 1 value and enable/disable flag
  * @param interval the interval time in micro seconds
  * @param enabled the flag to enable or disable the timer on gdo_start
- * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the interval is less than
- * 1000
- */
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the interval is less than 1000
+*/
 esp_err_t gdo_set_tof_timer(uint32_t interval, bool enabled);
 
 /**
  * @brief Set the obst test pulse interval timer value and enable/disable flag
  * @param interval the interval time in micro seconds
  * @param enabled the flag to enable or disable the timer on gdo_start
- * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the interval is less than
- * 1000
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the interval is less than 1000
  * @note Init config->obst_tp_pin with the desired GPIO pin
- */
+*/
 esp_err_t gdo_set_obst_test_pulse_timer(uint32_t interval, bool enabled);
 
 /**
  * @brief Sets the vehicle parked threshold in cm
  * @param vehicle_parked_threshold distance measure that triggers a parked state
- */
+*/
 esp_err_t gdo_set_vehicle_parked_threshold(uint16_t vehicle_parked_threshold);
 
 #ifdef __cplusplus
