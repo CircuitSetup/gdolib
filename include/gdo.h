@@ -128,6 +128,8 @@ typedef struct {
     uint8_t total_all;
 } gdo_paired_device_t;
 
+typedef struct gdo_status_t gdo_status_t;
+
 /**
  * @brief Callback function for GDO events.
  * @param status The current status of the GDO.
