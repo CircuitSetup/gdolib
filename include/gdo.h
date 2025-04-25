@@ -138,7 +138,7 @@ typedef struct gdo_status_t gdo_status_t;
 */
 typedef void (*gdo_event_callback_t)(const gdo_status_t *status, gdo_cb_event_t event, void *user_arg);
 
-typedef struct {
+typedef struct gdo_status_t {
     gdo_protocol_type_t protocol; // Protocol type
     gdo_door_state_t door; // Door state
     gdo_light_state_t light; // Light state
