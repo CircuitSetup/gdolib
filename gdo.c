@@ -1357,13 +1357,13 @@ static void decode_packet(uint8_t *packet) {
 
     if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
         g_status.device_type = (byte2 >> 2) & 0x0F;
-        g_status.manufacturer_id = ((byte2 & 0x03) << 3) | ((byte1 >> 5) & 0x07);
+        g_status.manufacturer = ((byte2 & 0x03) << 3) | ((byte1 >> 5) & 0x07);
 
         ESP_LOGI(TAG, "Device Type: %s (0x%02X), Manufacturer ID: %s (0x%02X)",
             gdo_device_type_to_string(g_status.device_type),
             g_status.device_type,
-            gdo_manufacturer_to_string(g_status.manufacturer_id),
-            g_status.manufacturer_id);
+            gdo_manufacturer_to_string(g_status.manufacturer),
+            g_status.manufacturer);
 
         if (g_status.cb != NULL) {
             g_status.cb(&g_status, GDO_CB_EVENT_METADATA, g_status.user_arg);

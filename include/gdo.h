@@ -162,7 +162,7 @@ typedef struct gdo_status_t {
     bool toggle_only; // Used when the door opener only supports the toggle command.
     gdo_door_state_t last_move_direction; // Last move direction
     uint8_t device_type;
-    uint8_t manufacturer_id;
+    uint8_t manufacturer;
     gdo_event_callback_t cb;
     void *user_arg;
 } gdo_status_t;
