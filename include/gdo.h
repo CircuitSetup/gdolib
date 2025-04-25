@@ -128,6 +128,14 @@ typedef struct {
     uint8_t total_all;
 } gdo_paired_device_t;
 
+/**
+ * @brief Callback function for GDO events.
+ * @param status The current status of the GDO.
+ * @param event The event that occurred.
+ * @param user_arg optional user argument to be passed to the callback.
+*/
+typedef void (*gdo_event_callback_t)(const gdo_status_t *status, gdo_cb_event_t event, void *user_arg);
+
 typedef struct {
     gdo_protocol_type_t protocol; // Protocol type
     gdo_door_state_t door; // Door state
@@ -167,14 +175,6 @@ typedef struct {
 } gdo_config_t;
 
 #define GDO_PAIRED_DEVICE_COUNT_UNKNOWN 0xff
-
-/**
- * @brief Callback function for GDO events.
- * @param status The current status of the GDO.
- * @param event The event that occurred.
- * @param user_arg optional user argument to be passed to the callback.
-*/
-typedef void (*gdo_event_callback_t)(const gdo_status_t *status, gdo_cb_event_t event, void *user_arg);
 
 /**
  * @brief Initializes the GDO driver.
