@@ -1355,6 +1355,19 @@ static void decode_packet(uint8_t *packet) {
 
     ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
 
+    if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+        g_status.device_type = (byte2 >> 2) & 0x0F;
+        g_status.manufacturer_id = ((byte2 & 0x03) << 3) | ((byte1 >> 5) & 0x07);
+
+        ESP_LOGI(TAG, "Device Type: %s (0x%02X), Manufacturer ID: %s (0x%02X)",
+            gdo_device_type_to_string(g_status.device_type),
+            g_status.device_type,
+            gdo_manufacturer_to_string(g_status.manufacturer_id),
+            g_status.manufacturer_id);
+
+        gdo_post_event(GDO_CB_EVENT_METADATA);
+    }
+
     if (cmd == GDO_CMD_STATUS) {
         update_door_state((gdo_door_state_t)nibble);
         update_light_state((gdo_light_state_t)((byte2 >> 1) & 1));

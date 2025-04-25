@@ -199,6 +199,32 @@ const char* v1_cmd_to_string(gdo_v1_command_t cmd) {
     }
 }
 
+const char* gdo_device_type_to_string(uint8_t type) {
+    switch (type) {
+        case 0x00: return "Unknown";
+        case 0x01: return "Remote Control";
+        case 0x02: return "Wireless Keypad";
+        case 0x03: return "Wall Control";
+        case 0x04: return "Accessory";
+        case 0x05: return "MyQ Bridge";
+        case 0x06: return "Internet Gateway";
+        default:   return "Other";
+    }
+}
+
+const char* gdo_manufacturer_to_string(uint8_t id) {
+    switch (id) {
+        case 0x00: return "Unknown";
+        case 0x01: return "Chamberlain";
+        case 0x02: return "LiftMaster";
+        case 0x03: return "Craftsman";
+        case 0x04: return "Raynor";
+        case 0x05: return "AccessMaster";
+        case 0x06: return "MasterMechanic";
+        default:   return "Other";
+    }
+}
+
 void print_buffer(gdo_protocol_type_t protocol, uint8_t* buf, bool is_tx) {
     if (protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
         ESP_LOGD(TAG, "%s: "

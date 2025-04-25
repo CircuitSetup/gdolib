@@ -117,6 +117,7 @@ typedef enum {
     GDO_CB_EVENT_OPEN_DURATION_MEASUREMENT,
     GDO_CB_EVENT_CLOSE_DURATION_MEASUREMENT,
     GDO_CB_EVENT_MAX,
+    GDO_CB_EVENT_METADATA,
 } gdo_cb_event_t;
 
 typedef struct {
@@ -150,6 +151,8 @@ typedef struct {
     uint32_t rolling_code; // Rolling code
     bool toggle_only; // Used when the door opener only supports the toggle command.
     gdo_door_state_t last_move_direction; // Last move direction
+    uint8_t device_type;
+    uint8_t manufacturer_id;
 } gdo_status_t;
 
 typedef struct {
