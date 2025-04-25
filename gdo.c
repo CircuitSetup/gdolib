@@ -1365,7 +1365,9 @@ static void decode_packet(uint8_t *packet) {
             gdo_manufacturer_to_string(g_status.manufacturer_id),
             g_status.manufacturer_id);
 
-        gdo_post_event(GDO_CB_EVENT_METADATA);
+        if (g_status.cb != NULL) {
+            g_status.cb(&g_status, GDO_CB_EVENT_METADATA, g_status.user_arg);
+        }
     }
 
     if (cmd == GDO_CMD_STATUS) {

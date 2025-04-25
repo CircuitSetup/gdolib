@@ -153,6 +153,8 @@ typedef struct {
     gdo_door_state_t last_move_direction; // Last move direction
     uint8_t device_type;
     uint8_t manufacturer_id;
+    gdo_event_callback_t cb;
+    void *user_arg;
 } gdo_status_t;
 
 typedef struct {
