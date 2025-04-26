@@ -19,7 +19,7 @@
 #include "gdo_priv.h"
 #include <string.h>
 
-static const char* const TAG = "gdolib";
+static const char *TAG = "gdolib";
 
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
