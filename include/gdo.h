@@ -117,7 +117,6 @@ typedef enum {
     GDO_CB_EVENT_OPEN_DURATION_MEASUREMENT,
     GDO_CB_EVENT_CLOSE_DURATION_MEASUREMENT,
     GDO_CB_EVENT_MAX,
-    GDO_CB_EVENT_METADATA,
 } gdo_cb_event_t;
 
 typedef struct {
@@ -128,17 +127,7 @@ typedef struct {
     uint8_t total_all;
 } gdo_paired_device_t;
 
-typedef struct gdo_status_t gdo_status_t;
-
-/**
- * @brief Callback function for GDO events.
- * @param status The current status of the GDO.
- * @param event The event that occurred.
- * @param user_arg optional user argument to be passed to the callback.
-*/
-typedef void (*gdo_event_callback_t)(const gdo_status_t *status, gdo_cb_event_t event, void *user_arg);
-
-typedef struct gdo_status_t {
+typedef struct {
     gdo_protocol_type_t protocol; // Protocol type
     gdo_door_state_t door; // Door state
     gdo_light_state_t light; // Light state
@@ -161,10 +150,6 @@ typedef struct gdo_status_t {
     uint32_t rolling_code; // Rolling code
     bool toggle_only; // Used when the door opener only supports the toggle command.
     gdo_door_state_t last_move_direction; // Last move direction
-    uint8_t device_type;
-    uint8_t manufacturer;
-    gdo_event_callback_t cb;
-    void *user_arg;
 } gdo_status_t;
 
 typedef struct {
@@ -177,6 +162,14 @@ typedef struct {
 } gdo_config_t;
 
 #define GDO_PAIRED_DEVICE_COUNT_UNKNOWN 0xff
+
+/**
+ * @brief Callback function for GDO events.
+ * @param status The current status of the GDO.
+ * @param event The event that occurred.
+ * @param user_arg optional user argument to be passed to the callback.
+*/
+typedef void (*gdo_event_callback_t)(const gdo_status_t *status, gdo_cb_event_t event, void *user_arg);
 
 /**
  * @brief Initializes the GDO driver.

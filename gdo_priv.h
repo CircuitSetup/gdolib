@@ -157,8 +157,6 @@ typedef union {
 
 const char* cmd_to_string(gdo_command_t cmd);
 const char* v1_cmd_to_string(gdo_v1_command_t cmd);
-const char* gdo_device_type_to_string(uint8_t type);
-const char* gdo_manufacturer_to_string(uint8_t id);
 void print_buffer(gdo_protocol_type_t protocol, uint8_t* buf, bool is_tx);
 
 extern const char *gdo_door_state_str[];

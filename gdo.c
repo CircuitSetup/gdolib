@@ -19,8 +19,6 @@
 #include "gdo_priv.h"
 #include <string.h>
 
-static const char *TAG = "gdolib";
-
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
 
@@ -1356,21 +1354,6 @@ static void decode_packet(uint8_t *packet) {
     uint8_t byte2 = (data >> 24) & 0xff;
 
     ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
-
-    //if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
-        g_status.device_type = (byte2 >> 2) & 0x0F;
-        g_status.manufacturer = ((byte2 & 0x03) << 3) | ((byte1 >> 5) & 0x07);
-
-        ESP_LOGI(TAG, "Device Type: %s (0x%02X), Manufacturer ID: %s (0x%02X)",
-            gdo_device_type_to_string(g_status.device_type),
-            g_status.device_type,
-            gdo_manufacturer_to_string(g_status.manufacturer),
-            g_status.manufacturer);
-
-        if (g_status.cb != NULL) {
-            g_status.cb(&g_status, GDO_CB_EVENT_METADATA, g_status.user_arg);
-        }
-    //}
 
     if (cmd == GDO_CMD_STATUS) {
         update_door_state((gdo_door_state_t)nibble);
