@@ -1355,7 +1355,7 @@ static void decode_packet(uint8_t *packet) {
 
     ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
 
-    if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+    //if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
         g_status.device_type = (byte2 >> 2) & 0x0F;
         g_status.manufacturer = ((byte2 & 0x03) << 3) | ((byte1 >> 5) & 0x07);
 
@@ -1368,7 +1368,7 @@ static void decode_packet(uint8_t *packet) {
         if (g_status.cb != NULL) {
             g_status.cb(&g_status, GDO_CB_EVENT_METADATA, g_status.user_arg);
         }
-    }
+    //}
 
     if (cmd == GDO_CMD_STATUS) {
         update_door_state((gdo_door_state_t)nibble);
