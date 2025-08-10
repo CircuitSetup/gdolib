@@ -439,6 +439,31 @@ int8_t encode_wireline(const uint32_t rolling, const uint64_t fixed,
   return 0;
 }
 
+int8_t encode_wireline_command(uint32_t rolling, uint64_t device_id,
+                               uint16_t command, uint32_t payload,
+                               uint8_t *packet) {
+  uint64_t fixed;
+  uint32_t data;
+
+  if ((device_id >> 40) != 0) {
+    return -1;
+  }
+
+  if ((command >> 12) != 0) {
+    return -1;
+  }
+
+  if ((payload >> 20) != 0) {
+    return -1;
+  }
+
+  fixed = (device_id & 0xf0ffffffff) | ((uint64_t)(command & 0xf00) << 24);
+  data = ((payload & 0xff) << 24) | ((payload & 0xff00) << 8) |
+         ((payload & 0xf0000) >> 8) | (command & 0xff);
+
+  return encode_wireline(rolling, fixed, data, packet);
+}
+
 static int8_t decode_wireline_half(const uint8_t *packet_half,
                                    uint32_t *rolling, uint32_t *fixed,
                                    uint16_t *data) {
@@ -453,6 +478,25 @@ static int8_t decode_wireline_half(const uint8_t *packet_half,
   if (err < 0) {
     return err;
   }
+
+  return 0;
+}
+
+int8_t decode_wireline_command(const uint8_t *packet, uint32_t *rolling,
+                               uint64_t *device_id, uint16_t *command,
+                               uint32_t *payload) {
+  int8_t err = 0;
+  uint64_t fixed;
+  uint32_t data;
+
+  err = decode_wireline(packet, rolling, &fixed, &data);
+  if (err < 0) {
+    return err;
+  }
+
+  *device_id = fixed & 0xf0ffffffff;
+  *command = ((fixed >> 24) & 0xf00) | (data & 0xff);
+  *payload = ((data << 8) & 0xf0000) | ((data >> 8) & 0xff00) | (data >> 24);
 
   return 0;
 }
@@ -487,4 +531,48 @@ int8_t decode_wireline(const uint8_t *packet, uint32_t *rolling,
   }
 
   return 0;
+}
+int8_t decode_wireless_command(const uint8_t *packet1, const uint8_t *packet2,
+                               uint32_t *rolling, uint64_t *device_id,
+                               uint8_t *button, uint8_t *switch_number,
+                               uint16_t *command, uint32_t *payload) {
+  int8_t err = 0;
+  uint64_t fixed;
+  uint32_t data;
+
+  err = decode_v2(0, packet1, packet2, rolling, &fixed, &data);
+  if (err < 0) {
+    return err;
+  }
+
+  if (button) {
+    *button = (fixed >> 32) & 0xf;
+  }
+  if (device_id) {
+    *device_id = fixed & 0xf0ffffffff;
+  }
+
+  *command = ((fixed >> 24) & 0xf00) | (data & 0xff);
+  *payload = ((data << 8) & 0xf0000) | ((data >> 8) & 0xff00) | (data >> 24);
+
+  if (switch_number) {
+    *switch_number = (*payload >> 16) & 0xff;
+  }
+
+  return 0;
+}
+
+uint8_t secplus_wireless_pressed(uint32_t payload) {
+  return (payload >> 8) & 1;
+}
+
+void secplus_wireless_parse_status(uint32_t payload, secplus_status_t *status) {
+  status->door = (payload >> 16) & 0xff;
+  status->learn = (payload >> 5) & 1;
+  status->unk1 = (payload >> 4) & 1;
+  status->unk2 = (payload >> 2) & 1;
+  status->light = (payload >> 1) & 1;
+  status->lock = payload & 1;
+  status->blocked = ((payload >> 14) & 1) ^ 1;
+  status->unk3 = (payload >> 13) & 1;
 }
