@@ -136,7 +136,7 @@ typedef struct {
     gdo_obstruction_state_t obstruction; // Obstruction state
     gdo_motor_state_t motor; // Motor state
     gdo_button_state_t button; // Button state
-    gdo_battery_state_t battery; // Battery state of the last remote
+    gdo_battery_state_t battery; // Battery state
     gdo_learn_state_t learn; // Learn state
     gdo_paired_device_t paired_devices; // Paired devices
     bool synced; // Synced state
