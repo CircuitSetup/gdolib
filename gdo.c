@@ -89,6 +89,7 @@ static gdo_status_t g_status = {
     .door_target = -1,
     .client_id = 0x666,
     .rolling_code = 0,
+    .remote_id = 0,
     .toggle_only = false,
     .last_move_direction = GDO_DOOR_STATE_UNKNOWN,
 };
@@ -1342,12 +1343,15 @@ static void decode_packet(uint8_t *packet) {
 
     data &= ~0xf000;
 
-    if ((fixed & 0xFFFFFFFF) == g_status.client_id) { // my commands
+    uint32_t remote_id = (uint32_t)(fixed & 0xFFFFFFFF);
+    if (remote_id == g_status.client_id) { // my commands
         ESP_LOGE(TAG, "received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
         return;
     } else {
         ESP_LOGI(TAG, "received rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
     }
+
+    g_status.remote_id = remote_id;
 
     gdo_command_t cmd = ((fixed >> 24) & 0xf00) | (data & 0xff);
     uint8_t nibble = (data >> 8) & 0xff;

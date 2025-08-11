@@ -136,7 +136,7 @@ typedef struct {
     gdo_obstruction_state_t obstruction; // Obstruction state
     gdo_motor_state_t motor; // Motor state
     gdo_button_state_t button; // Button state
-    gdo_battery_state_t battery; // Battery state
+    gdo_battery_state_t battery; // Battery state of the last remote
     gdo_learn_state_t learn; // Learn state
     gdo_paired_device_t paired_devices; // Paired devices
     bool synced; // Synced state
@@ -148,6 +148,7 @@ typedef struct {
     int32_t door_target; // Door target position in percentage (0-10000) [OPEN-CLOSED]
     uint32_t client_id; // Client ID
     uint32_t rolling_code; // Rolling code
+    uint32_t remote_id; // Identifier of the last remote that triggered an event
     bool toggle_only; // Used when the door opener only supports the toggle command.
     gdo_door_state_t last_move_direction; // Last move direction
 } gdo_status_t;
