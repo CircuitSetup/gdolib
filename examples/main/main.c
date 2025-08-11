@@ -59,8 +59,7 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         ESP_LOGI(TAG, "Motion: %s", gdo_motion_state_to_string(status->motion));
         break;
     case GDO_CB_EVENT_BATTERY:
-        ESP_LOGI(TAG, "Remote %" PRIu32 " battery: %s", status->remote_id,
-                 gdo_battery_state_to_string(status->battery));
+        ESP_LOGI(TAG, "Battery: %s", gdo_battery_state_to_string(status->battery));
         break;
     case GDO_CB_EVENT_BUTTON:
         ESP_LOGI(TAG, "Remote %" PRIu32 " button: %s", status->remote_id,
