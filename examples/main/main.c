@@ -17,6 +17,7 @@
 
 #include "esp_log.h"
 #include "gdo.h"
+#include <inttypes.h>
 
 static const char *TAG = "test_main";
 
@@ -58,10 +59,12 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         ESP_LOGI(TAG, "Motion: %s", gdo_motion_state_to_string(status->motion));
         break;
     case GDO_CB_EVENT_BATTERY:
-        ESP_LOGI(TAG, "Battery: %s", gdo_battery_state_to_string(status->battery));
+        ESP_LOGI(TAG, "Remote %" PRIu32 " battery: %s", status->remote_id,
+                 gdo_battery_state_to_string(status->battery));
         break;
     case GDO_CB_EVENT_BUTTON:
-        ESP_LOGI(TAG, "Button: %s", gdo_button_state_to_string(status->button));
+        ESP_LOGI(TAG, "Remote %" PRIu32 " button: %s", status->remote_id,
+                 gdo_button_state_to_string(status->button));
         break;
     case GDO_CB_EVENT_MOTOR:
         ESP_LOGI(TAG, "Motor: %s", gdo_motor_state_to_string(status->motor));
