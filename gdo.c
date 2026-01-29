@@ -87,7 +87,7 @@ static gdo_status_t g_status = {
     .close_ms = 0,
     .door_position = -1,
     .door_target = -1,
-    .client_id = 0x666,
+    .client_id = 0x2908,
     .rolling_code = 0,
     .remote_id = 0,
     .toggle_only = false,
@@ -531,11 +531,11 @@ esp_err_t gdo_light_on(void) {
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
-    } else {
-        err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_ON, 0, 0);
-        if (err == ESP_OK) {
-            get_status();
-        }
+    }
+
+    err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_ON, 0, 0);
+    if (err == ESP_OK) {
+        err = get_status();
     }
 
     return err;
@@ -554,11 +554,11 @@ esp_err_t gdo_light_off(void) {
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
-    } else {
-        err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_OFF, 0, 0);
-        if (err == ESP_OK) {
-            get_status();
-        }
+    }
+
+    err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_OFF, 0, 0);
+    if (err == ESP_OK) {
+        err = get_status();
     }
 
     return err;
@@ -570,13 +570,18 @@ esp_err_t gdo_light_off(void) {
  * ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_light_toggle(void) {
-    if (g_status.light == GDO_LIGHT_STATE_ON) {
-        return gdo_light_off();
-    } else if (g_status.light == GDO_LIGHT_STATE_OFF) {
-        return gdo_light_on();
-    } else {
-        return ESP_ERR_NOT_FOUND;
+    esp_err_t err = ESP_OK;
+
+    if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
     }
+
+    err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_TOGGLE, 0, 0);
+    if (err == ESP_OK) {
+        err = get_status();
+    }
+
+    return err;
 }
 
 /**
@@ -590,9 +595,9 @@ esp_err_t gdo_lock(void) {
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
-    } else {
-        return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_LOCK, 0, 0);
     }
+
+    return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_LOCK, 0, 0);
 }
 
 /**
@@ -606,9 +611,9 @@ esp_err_t gdo_unlock(void) {
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
-    } else {
-        return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_UNLOCK, 0, 0);
     }
+
+    return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_UNLOCK, 0, 0);
 }
 
 /**
@@ -617,13 +622,11 @@ esp_err_t gdo_unlock(void) {
  * ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_lock_toggle(void) {
-    if (g_status.lock == GDO_LOCK_STATE_LOCKED) {
-        return gdo_unlock();
-    } else if (g_status.lock == GDO_LOCK_STATE_UNLOCKED) {
-        return gdo_lock();
-    } else {
-        return ESP_ERR_NOT_FOUND;
+    if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
     }
+
+    return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_TOGGLE, 0, 0);
 }
 
 /**
@@ -637,10 +640,11 @@ esp_err_t gdo_activate_learn(void) {
     }
 
     esp_err_t err = queue_command(GDO_CMD_LEARN, GDO_LEARN_ACTION_ACTIVATE, 0, 0);
-    if (err != ESP_OK) {
-        return err;
+    if (err == ESP_OK) {
+        err = get_status();
     }
-    return get_status();
+
+    return err;
 }
 
 /**
@@ -654,10 +658,11 @@ esp_err_t gdo_deactivate_learn(void) {
     }
 
     esp_err_t err = queue_command(GDO_CMD_LEARN, GDO_LEARN_ACTION_DEACTIVATE, 0, 0);
-    if (err != ESP_OK) {
-        return err;
+    if (err == ESP_OK) {
+        err = get_status();
     }
-    return get_status();
+
+    return err;
 }
 
 /**
@@ -1699,6 +1704,10 @@ static void update_door_state(const gdo_door_state_t door_state) {
     static int64_t start_opening;
     static int64_t start_closing;
 
+    if (door_state == g_status.door) {
+        return;
+    }
+
     ESP_LOGD(TAG, "Door state: %s", gdo_door_state_str[door_state]);
 
     if (!g_status.open_ms) {
@@ -1833,6 +1842,10 @@ inline static esp_err_t send_door_action(gdo_door_action_t action) {
  * @param light_state The new light state to update to.
 */
 inline static void update_light_state(gdo_light_state_t light_state) {
+    if (light_state == g_status.light) {
+        return;
+    }
+
     ESP_LOGD(TAG, "Light state: %s", gdo_light_state_str[light_state]);
     g_status.light = light_state;
     queue_event((gdo_event_t){GDO_EVENT_LIGHT_UPDATE});
@@ -1843,6 +1856,10 @@ inline static void update_light_state(gdo_light_state_t light_state) {
  * @param lock_state The new lock state to update to.
 */
 inline static void update_lock_state(gdo_lock_state_t lock_state) {
+    if (lock_state == g_status.lock) {
+        return;
+    }
+
     ESP_LOGD(TAG, "Lock state: %s", gdo_lock_state_str[lock_state]);
     g_status.lock = lock_state;
     queue_event((gdo_event_t){GDO_EVENT_LOCK_UPDATE});
@@ -1853,6 +1870,10 @@ inline static void update_lock_state(gdo_lock_state_t lock_state) {
  * @param obstruction_state The new obstruction state to update to.
 */
 inline static void update_obstruction_state(gdo_obstruction_state_t obstruction_state) {
+    if (obstruction_state == g_status.obstruction) {
+        return;
+    }
+
     ESP_LOGD(TAG, "Obstruction state: %s", gdo_obstruction_state_str[obstruction_state]);
     if (obstruction_state != g_status.obstruction) {
         g_status.obstruction = obstruction_state;
@@ -1866,6 +1887,10 @@ inline static void update_obstruction_state(gdo_obstruction_state_t obstruction_
  * @param learn_state The new learn state to update to.
 */
 inline static void update_learn_state(gdo_learn_state_t learn_state) {
+    if (learn_state == g_status.learn) {
+        return;
+    }
+
     ESP_LOGD(TAG, "Learn state: %s", gdo_learn_state_str[learn_state]);
     g_status.learn = learn_state;
     queue_event((gdo_event_t){GDO_EVENT_LEARN_UPDATE});
