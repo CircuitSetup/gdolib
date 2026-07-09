@@ -1,0 +1,25 @@
+{
+  "name": "gdolib",
+  "version": "0.0.0",
+  "description": "Garage door opener library for Security+ garage door openers on ESP32.",
+  "keywords": [
+    "garage",
+    "security-plus",
+    "esp32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CircuitSetup/gdolib.git"
+  },
+  "license": "GPL-3.0-or-later",
+  "frameworks": [
+    "espidf"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "build": {
+    "srcDir": ".",
+    "includeDir": "include"
+  }
+}
