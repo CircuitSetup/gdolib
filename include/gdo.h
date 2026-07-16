@@ -276,6 +276,11 @@ esp_err_t gdo_unlock(void);
 esp_err_t gdo_toggle_lock(void);
 
 /**
+ * @brief Legacy alias for gdo_toggle_lock().
+ */
+esp_err_t gdo_lock_toggle(void);
+
+/**
  * @brief Activates the learn mode.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
@@ -373,8 +378,9 @@ const char *gdo_protocol_type_to_string(gdo_protocol_type_t type);
 
 /**
  * @brief Sets the Security+ V2 rolling code.
- * @param rolling_code The rolling code to set.
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the GDO is already synced.
+ * @param rolling_code The 28-bit rolling code to set (0-0x0fffffff).
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the rolling code is out of range,
+ * ESP_ERR_INVALID_STATE if the GDO is already synced.
 */
 esp_err_t gdo_set_rolling_code(uint32_t rolling_code);
 

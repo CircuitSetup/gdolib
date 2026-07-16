@@ -22,6 +22,7 @@
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
 
+#define GDO_ROLLING_CODE_MAX 0x0FFFFFFFU
 
 /***************************** LOCAL FUNCTION DECLARATIONS ****************************/
 static void obst_isr_handler(void* arg);
@@ -58,6 +59,7 @@ static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_
 static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us);
 static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd);
 static esp_err_t queue_event(gdo_event_t event);
+static void delete_timer(esp_timer_handle_t *timer);
 
 
 /******************************** GLOBAL VARIABLES ************************************/
@@ -104,8 +106,17 @@ static QueueHandle_t gdo_event_queue;
 static esp_timer_handle_t motion_detect_timer;
 static esp_timer_handle_t door_position_sync_timer;
 static esp_timer_handle_t obst_timer;
+static esp_timer_handle_t v1_status_timer;
+static gdo_obstruction_stats_t g_obstruction_stats;
 static void *g_user_cb_arg;
 static uint32_t g_tx_delay_ms = 50;
+static uint32_t g_driver_generation;
+static uint32_t g_last_obstruction_time;
+static uint8_t g_v1_status_index;
+static bool g_openings_known;
+static bool g_obst_clear_from_status;
+static bool g_obst_isr_registered;
+static bool g_uart_driver_installed;
 static portMUX_TYPE gdo_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // Empirical offset added to the move-to-target STOP delay to compensate for the
@@ -123,6 +134,18 @@ static const uint32_t MOVE_TO_TARGET_NEAR_THRESHOLD = 200;
 // motion starts, so STOP needs to be pushed out to align the motor pulse.
 static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
 
+static void delete_timer(esp_timer_handle_t *timer) {
+    if (!*timer) {
+        return;
+    }
+
+    if (esp_timer_is_active(*timer)) {
+        esp_timer_stop(*timer);
+    }
+    esp_timer_delete(*timer);
+    *timer = NULL;
+}
+
 
 /******************************* PUBLIC API FUNCTIONS **********************************/
 
@@ -134,9 +157,13 @@ static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
 */
 esp_err_t gdo_init(const gdo_config_t *config) {
     esp_err_t err = ESP_OK;
+    bool obst_pin_configured = false;
+    bool uart_pins_configured = false;
 
-    if (!config || config->uart_num >= UART_NUM_MAX ||
-        config->uart_tx_pin >= GPIO_NUM_MAX || config->uart_rx_pin >= GPIO_NUM_MAX) {
+    if (!config || config->uart_num < 0 || config->uart_num >= UART_NUM_MAX ||
+        config->uart_tx_pin < 0 || config->uart_tx_pin >= GPIO_NUM_MAX ||
+        config->uart_rx_pin < 0 || config->uart_rx_pin >= GPIO_NUM_MAX ||
+        config->obst_in_pin >= GPIO_NUM_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -145,6 +172,7 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     }
 
     g_config = *config;
+    ++g_driver_generation;
 
     esp_timer_create_args_t timer_args = {
         .callback = motion_detect_timer_cb,
@@ -154,7 +182,7 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     };
     err = esp_timer_create(&timer_args, &motion_detect_timer);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
 
     timer_args.callback = door_position_sync_timer_cb;
@@ -163,7 +191,7 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     timer_args.name = "door_position_sync_timer";
     err = esp_timer_create(&timer_args, &door_position_sync_timer);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
 
     if (g_config.obst_in_pin >= 0 && !g_config.obst_from_status) {
@@ -173,33 +201,32 @@ esp_err_t gdo_init(const gdo_config_t *config) {
         io_conf.pin_bit_mask = (1ULL<<g_config.obst_in_pin);
         io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
         io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-        gdo_obstruction_stats_t *obst_stats = (gdo_obstruction_stats_t*)calloc(1, sizeof(gdo_obstruction_stats_t));
-        if (!obst_stats) {
-            return ESP_ERR_NO_MEM;
-        }
+        g_obstruction_stats = (gdo_obstruction_stats_t){0};
 
         err = gpio_install_isr_service(0);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-            return err;
+            goto fail;
         }
 
-        err = gpio_isr_handler_add(g_config.obst_in_pin, obst_isr_handler, (void*)obst_stats);
+        err = gpio_isr_handler_add(g_config.obst_in_pin, obst_isr_handler, &g_obstruction_stats);
         if (err != ESP_OK) {
-            return err;
+            goto fail;
         }
+        g_obst_isr_registered = true;
 
         err = gpio_config(&io_conf);
         if (err != ESP_OK) {
-            return err;
+            goto fail;
         }
+        obst_pin_configured = true;
 
         timer_args.callback = obst_timer_cb;
-        timer_args.arg = (void*)obst_stats;
+        timer_args.arg = &g_obstruction_stats;
         timer_args.dispatch_method = ESP_TIMER_TASK;
         timer_args.name = "obst_timer";
         err = esp_timer_create(&timer_args, &obst_timer);
         if (err != ESP_OK) {
-            return err;
+            goto fail;
         }
     }
 
@@ -215,28 +242,47 @@ esp_err_t gdo_init(const gdo_config_t *config) {
 
     err = uart_param_config(g_config.uart_num, &uart_config);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
 
     if (g_config.invert_uart) {
         err = uart_set_line_inverse(g_config.uart_num, UART_SIGNAL_RXD_INV | UART_SIGNAL_TXD_INV);
         if (err != ESP_OK) {
-            return err;
+            goto fail;
         }
     }
 
     err = uart_set_pin(g_config.uart_num, g_config.uart_tx_pin, g_config.uart_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    uart_pins_configured = true;
 
     gdo_tx_queue = xQueueCreate(16, sizeof(gdo_tx_message_t));
     if (!gdo_tx_queue) {
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
     ESP_LOGI(TAG, "GDO initilized");
     return ESP_OK;
+
+fail:
+    delete_timer(&obst_timer);
+    delete_timer(&door_position_sync_timer);
+    delete_timer(&motion_detect_timer);
+    if (g_obst_isr_registered) {
+        gpio_isr_handler_remove(g_config.obst_in_pin);
+        g_obst_isr_registered = false;
+    }
+    if (obst_pin_configured) {
+        gpio_reset_pin(g_config.obst_in_pin);
+    }
+    if (uart_pins_configured) {
+        gpio_reset_pin(g_config.uart_tx_pin);
+        gpio_reset_pin(g_config.uart_rx_pin);
+    }
+    return err;
 }
 
 /**
@@ -244,10 +290,13 @@ esp_err_t gdo_init(const gdo_config_t *config) {
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the driver is not initialized.
 */
 esp_err_t gdo_deinit(void) {
-    esp_err_t err = ESP_OK;
+    esp_err_t err;
+    esp_err_t result = ESP_OK;
     if (!gdo_tx_queue) { // using this as a proxy for the driver being initialized
         return ESP_ERR_INVALID_STATE;
     }
+
+    ++g_driver_generation;
 
     if (gdo_main_task_handle) {
         vTaskDelete(gdo_main_task_handle);
@@ -259,30 +308,30 @@ esp_err_t gdo_deinit(void) {
         gdo_sync_task_handle = NULL;
     }
 
-    if (gdo_tx_queue) {
-        vQueueDelete(gdo_tx_queue);
-        gdo_tx_queue = NULL;
+    delete_timer(&v1_status_timer);
+    delete_timer(&obst_timer);
+    delete_timer(&door_position_sync_timer);
+    delete_timer(&motion_detect_timer);
+
+    if (g_obst_isr_registered) {
+        err = gpio_isr_handler_remove(g_config.obst_in_pin);
+        if (result == ESP_OK && err != ESP_OK) {
+            result = err;
+        }
+        g_obst_isr_registered = false;
     }
 
-    if (gdo_event_queue) {
-        vQueueDelete(gdo_event_queue);
-        gdo_event_queue = NULL;
-    }
+    vQueueDelete(gdo_tx_queue);
+    gdo_tx_queue = NULL;
 
-    if (motion_detect_timer) {
-        esp_timer_delete(motion_detect_timer);
-        motion_detect_timer = NULL;
+    if (g_uart_driver_installed) {
+        err = uart_driver_delete(g_config.uart_num);
+        if (result == ESP_OK && err != ESP_OK) {
+            result = err;
+        }
+        g_uart_driver_installed = false;
     }
-
-    if (door_position_sync_timer) {
-        esp_timer_delete(door_position_sync_timer);
-        door_position_sync_timer = NULL;
-    }
-
-    if (obst_timer) {
-        esp_timer_delete(obst_timer);
-        obst_timer = NULL;
-    }
+    gdo_event_queue = NULL;
 
     g_protocol_forced = false;
     g_status.synced = false;
@@ -291,6 +340,7 @@ esp_err_t gdo_deinit(void) {
     g_status.light = GDO_LIGHT_STATE_MAX;
     g_status.lock = GDO_LOCK_STATE_MAX;
     g_status.motion = GDO_MOTION_STATE_MAX;
+    g_status.obstruction = GDO_OBSTRUCTION_STATE_MAX;
     g_status.motor = GDO_MOTOR_STATE_MAX;
     g_status.button = GDO_BUTTON_STATE_MAX;
     g_status.battery = GDO_BATT_STATE_UNKNOWN;
@@ -306,21 +356,38 @@ esp_err_t gdo_deinit(void) {
     g_status.close_ms = 0;
     g_status.door_position = -1;
     g_status.door_target = -1;
+    g_status.client_id = 0x2908;
+    g_status.rolling_code = 0;
+    g_status.remote_id = 0;
+    g_status.toggle_only = false;
+    g_status.last_move_direction = GDO_DOOR_STATE_UNKNOWN;
+    g_openings_known = false;
+    g_obst_clear_from_status = false;
+    g_last_obstruction_time = 0;
+    g_v1_status_index = 0;
+    g_door_start_moving_ms = 0;
+    g_tx_delay_ms = 50;
+    g_event_callback = NULL;
+    g_user_cb_arg = NULL;
 
     err = gpio_reset_pin(g_config.uart_tx_pin);
-    if (err != ESP_OK) {
-        goto done;
+    if (result == ESP_OK && err != ESP_OK) {
+        result = err;
     }
 
     err = gpio_reset_pin(g_config.uart_rx_pin);
-    if (err != ESP_OK) {
-        goto done;
+    if (result == ESP_OK && err != ESP_OK) {
+        result = err;
     }
 
-    err = uart_driver_delete(g_config.uart_num);
+    if (g_config.obst_in_pin >= 0 && !g_config.obst_from_status) {
+        err = gpio_reset_pin(g_config.obst_in_pin);
+        if (result == ESP_OK && err != ESP_OK) {
+            result = err;
+        }
+    }
 
-done:
-    return err;
+    return result;
 }
 
 /**
@@ -330,28 +397,43 @@ done:
  * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, ESP_ERR_INVALID_STATE if the driver is not initialized.
 */
 esp_err_t gdo_start(gdo_event_callback_t event_callback, void *user_arg) {
-    if (!gdo_tx_queue) { // using this as a proxy for the driver being initialized
+    if (!gdo_tx_queue || g_uart_driver_installed || gdo_main_task_handle) {
         return ESP_ERR_INVALID_STATE;
     }
     g_user_cb_arg = user_arg;
+    g_event_callback = event_callback;
 
     esp_err_t err = uart_driver_install(g_config.uart_num, RX_BUFFER_SIZE, 0, 32, &gdo_event_queue, 0);
     if (err != ESP_OK) {
+        g_event_callback = NULL;
+        g_user_cb_arg = NULL;
         return err;
     }
+    g_uart_driver_installed = true;
 
     uart_flush(g_config.uart_num);
 
     if (xTaskCreate(gdo_main_task, "gdo_main_task", 4096, NULL, 15, &gdo_main_task_handle) != pdPASS) {
+        uart_driver_delete(g_config.uart_num);
+        g_uart_driver_installed = false;
+        gdo_event_queue = NULL;
+        g_event_callback = NULL;
+        g_user_cb_arg = NULL;
         return ESP_ERR_NO_MEM;
     }
 
     err = gdo_sync();
     if (err != ESP_OK) {
+        vTaskDelete(gdo_main_task_handle);
+        gdo_main_task_handle = NULL;
+        uart_driver_delete(g_config.uart_num);
+        g_uart_driver_installed = false;
+        gdo_event_queue = NULL;
+        g_event_callback = NULL;
+        g_user_cb_arg = NULL;
         return err;
     }
 
-    g_event_callback = event_callback;
     ESP_LOGI(TAG, "GDO Started");
     return err;
 }
@@ -498,8 +580,8 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    int delta = g_status.door_position - target;
-    int abs_delta = delta < 0 ? -delta : delta;
+    int32_t delta = g_status.door_position - (int32_t)target;
+    int32_t abs_delta = delta < 0 ? -delta : delta;
 
     if ((uint32_t)abs_delta < MOVE_TO_TARGET_NEAR_THRESHOLD) {
         ESP_LOGI(TAG, "Move to target %.2f%% no-op: already within %.2f%% (current %.2f%%)",
@@ -675,12 +757,16 @@ esp_err_t gdo_unlock(void) {
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if current state is unknown,
  * ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
-esp_err_t gdo_lock_toggle(void) {
+esp_err_t gdo_toggle_lock(void) {
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
     }
 
     return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_TOGGLE, 0, 0);
+}
+
+esp_err_t gdo_lock_toggle(void) {
+    return gdo_toggle_lock();
 }
 
 /**
@@ -732,7 +818,7 @@ esp_err_t gdo_clear_paired_devices(gdo_paired_device_type_t type) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    if (type >= GDO_PAIRED_DEVICE_TYPE_MAX) {
+    if ((int)type < 0 || type >= GDO_PAIRED_DEVICE_TYPE_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -778,6 +864,9 @@ esp_err_t gdo_set_rolling_code(uint32_t rolling_code) {
     if (g_status.synced) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (rolling_code > GDO_ROLLING_CODE_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     g_status.rolling_code = rolling_code;
     return ESP_OK;
@@ -808,7 +897,7 @@ esp_err_t gdo_set_protocol(gdo_protocol_type_t protocol) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (protocol < GDO_PROTOCOL_MAX) {
+    if ((int)protocol >= 0 && protocol < GDO_PROTOCOL_MAX) {
         g_status.protocol = protocol;
         g_protocol_forced = protocol > 0;
         return ESP_OK;
@@ -896,7 +985,7 @@ static void gdo_sync_task(void* arg) {
                 .name = "v1_status_timer"
             };
 
-            esp_timer_handle_t v1_status_timer;
+            delete_timer(&v1_status_timer);
             if (esp_timer_create(&timer_args, &v1_status_timer) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to create V1 status timer");
                 synced = false;
@@ -904,18 +993,26 @@ static void gdo_sync_task(void* arg) {
             } else {
                 uart_flush(g_config.uart_num);
                 xQueueReset(gdo_event_queue);
-                esp_timer_start_periodic(v1_status_timer, 250 * 1000);
+                if (esp_timer_start_periodic(v1_status_timer, 250 * 1000) != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to start V1 status timer");
+                    delete_timer(&v1_status_timer);
+                    synced = false;
+                    goto done;
+                }
             }
 
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
 
-            if (g_status.door == GDO_DOOR_STATE_UNKNOWN && !g_protocol_forced) {
-                ESP_LOGW(TAG, "secplus V1 panel emulation failed, trying secplus V2 panel emulation");
-                esp_timer_stop(v1_status_timer);
-                esp_timer_delete(v1_status_timer);
-            } else {
+            if (g_status.door != GDO_DOOR_STATE_UNKNOWN) {
                 goto done;
             }
+
+            delete_timer(&v1_status_timer);
+            if (g_protocol_forced) {
+                synced = false;
+                goto done;
+            }
+            ESP_LOGW(TAG, "secplus V1 panel emulation failed, trying secplus V2 panel emulation");
         } else {
             ESP_LOGI(TAG, "V1 panel found");
             g_status.protocol = GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL;
@@ -948,7 +1045,7 @@ static void gdo_sync_task(void* arg) {
             timeout += 1000;
         }
 
-        if (g_status.openings == 0) {
+        if (!g_openings_known) {
             ESP_LOGI(TAG, "SYNC TASK: Getting openings");
             get_openings();
             continue;
@@ -1056,7 +1153,6 @@ static void obst_timer_cb(void* arg) {
 
     if (obs_state != GDO_OBSTRUCTION_STATE_MAX && obs_state != g_status.obstruction) {
         update_obstruction_state(obs_state);
-        queue_event((gdo_event_t){GDO_EVENT_OBST});
     }
 }
 
@@ -1113,12 +1209,14 @@ static void door_position_sync_timer_cb(void* arg) {
 static void scheduled_cmd_timer_cb(void* arg) {
     gdo_sched_cmd_args_t *args = (gdo_sched_cmd_args_t*)arg;
 
-    if (args->door_cmd) {
-        ESP_LOGI(TAG, "Scheduled door action %" PRIu32 " firing at %.2f%%",
-                 args->cmd, g_status.door_position / 100.0f);
-        send_door_action((gdo_door_action_t)args->cmd);
-    } else {
-        queue_command((gdo_command_t)args->cmd, args->nibble, args->byte1, args->byte2);
+    if (args->generation == g_driver_generation) {
+        if (args->door_cmd) {
+            ESP_LOGI(TAG, "Scheduled door action %" PRIu32 " firing at %.2f%%",
+                     args->cmd, g_status.door_position / 100.0f);
+            send_door_action((gdo_door_action_t)args->cmd);
+        } else {
+            queue_command((gdo_command_t)args->cmd, args->nibble, args->byte1, args->byte2);
+        }
     }
 
     // Command timers are one-shot, delete the timer and free the args.
@@ -1133,10 +1231,9 @@ static void scheduled_cmd_timer_cb(void* arg) {
 static void v1_status_timer_cb(void* arg) {
     const char secplus1_cmds[] = { 0x35, 0x35, 0x35, 0x35, 0x33, 0x33, 0x53, 0x53, 0x38,
                                    0x3A, 0x3A, 0x3A, 0x39, 0x38, 0x3A, 0x38, 0x3A, 0x39, 0x3A };
-    static uint8_t index = 0;
-    queue_v1_command((gdo_v1_command_t)secplus1_cmds[index++]);
-    if (index == 18) {
-        index = 15;
+    queue_v1_command((gdo_v1_command_t)secplus1_cmds[g_v1_status_index++]);
+    if (g_v1_status_index == 18) {
+        g_v1_status_index = 15;
     }
 }
 
@@ -1146,7 +1243,8 @@ static void v1_status_timer_cb(void* arg) {
 */
 static void scheduled_event_timer_cb(void* arg) {
     gdo_sched_evt_args_t *args = (gdo_sched_evt_args_t*)arg;
-    if (queue_event((gdo_event_t){args->event}) != ESP_OK) {
+    if (args->generation == g_driver_generation &&
+        queue_event((gdo_event_t){args->event}) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to queue scheduled event");
     }
 
@@ -1177,6 +1275,7 @@ static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_
     }
 
     *args = *cmd_args;
+    args->generation = g_driver_generation;
     esp_timer_create_args_t timer_args = {
         .callback = scheduled_cmd_timer_cb,
         .arg = args,
@@ -1192,6 +1291,7 @@ static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_
 
     err = esp_timer_start_once(args->timer, time_us);
     if (err != ESP_OK) {
+        esp_timer_delete(args->timer);
         free(args);
     }
 
@@ -1215,6 +1315,7 @@ static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us) {
     }
 
     event_arg->event = event;
+    event_arg->generation = g_driver_generation;
     esp_timer_create_args_t timer_args = {
         .callback = scheduled_event_timer_cb,
         .arg = event_arg,
@@ -1230,6 +1331,7 @@ static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us) {
 
     err = esp_timer_start_once(event_arg->timer, time_us);
     if (err != ESP_OK) {
+        esp_timer_delete(event_arg->timer);
         free(event_arg);
     }
 
@@ -1275,34 +1377,36 @@ static esp_err_t queue_v1_command(gdo_v1_command_t command) {
  *  ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2) {
-    if (!gdo_tx_queue) {
+    if (!gdo_tx_queue || !gdo_event_queue) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    gdo_tx_message_t message;
-    message.cmd = command;
-    message.packet = (uint8_t*)malloc(19); // will be freed in the gdo_main_task
-    message.sent_ms = esp_timer_get_time() / 1000;
+    gdo_tx_message_t message = {
+        .cmd = command,
+        .sent_ms = esp_timer_get_time() / 1000,
+    };
+    bool secplus_v2 = g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2;
 
     // if we are here without a protocol defined then V1 testing failed, proceed with v2
-    if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+    if (secplus_v2) {
         uint64_t cmd = command;
         uint64_t fixed = ((cmd & ~0xff) << 24) | g_status.client_id;
-        uint32_t data = (byte2 << 24) | (byte1 << 16) | (nibble << 8) | (cmd & 0xff);
+        uint32_t data = ((uint32_t)byte2 << 24) | ((uint32_t)byte1 << 16) |
+                        ((uint32_t)nibble << 8) | (cmd & 0xff);
 
         if (encode_wireline(g_status.rolling_code, fixed, data, message.packet) != 0) {
-            free(message.packet);
             return ESP_FAIL;
         }
-
-        g_status.rolling_code++;
     } else {
-        *message.packet = command;
+        message.packet[0] = command;
     }
 
     print_buffer(g_status.protocol, message.packet, true);
     if (xQueueSendToBack(gdo_tx_queue, &message, 0) == pdFALSE) {
         return ESP_ERR_NO_MEM;
+    }
+    if (secplus_v2) {
+        g_status.rolling_code = (g_status.rolling_code + 1U) & GDO_ROLLING_CODE_MAX;
     }
 
     return queue_event((gdo_event_t){GDO_EVENT_TX_PENDING});
@@ -1414,9 +1518,6 @@ static void decode_packet(uint8_t *packet) {
     uint32_t data = 0;
     uint32_t time_now = esp_timer_get_time() / 1000;
 
-    static uint32_t last_obstruction_time = 0;
-    static bool obst_clear_from_status = false;
-
     if (decode_wireline(packet, &rolling, &fixed, &data) != 0) {
         ESP_LOGD(TAG, "Failed to decode wireline frame; dropping");
         return;
@@ -1447,10 +1548,10 @@ static void decode_packet(uint8_t *packet) {
         update_lock_state((gdo_lock_state_t)(byte2 & 1));
         update_learn_state((gdo_learn_state_t)((byte2 >> 5) & 1));
         if (g_config.obst_from_status &&
-            (g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX || obst_clear_from_status)) {
+            (g_status.obstruction == GDO_OBSTRUCTION_STATE_MAX || g_obst_clear_from_status)) {
             update_obstruction_state((gdo_obstruction_state_t)((byte1 >> 6) & 1));
             if (g_status.obstruction == GDO_OBSTRUCTION_STATE_CLEAR) {
-                obst_clear_from_status = false;
+                g_obst_clear_from_status = false;
             }
         }
     } else if (cmd == GDO_CMD_LIGHT) {
@@ -1485,19 +1586,19 @@ static void decode_packet(uint8_t *packet) {
          * because many obstruction events will be sent when a long obstruction is cleared so this
          * avoids an incorrect state being reported.
          */
-        if (g_config.obst_from_status && time_now - last_obstruction_time > 1000) {
-            if (obst_clear_from_status) {
+        if (g_config.obst_from_status && time_now - g_last_obstruction_time > 1000) {
+            if (g_obst_clear_from_status) {
                 get_status();
             } else {
                 update_obstruction_state(g_status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED ? GDO_OBSTRUCTION_STATE_CLEAR : GDO_OBSTRUCTION_STATE_OBSTRUCTED);
             }
-            last_obstruction_time = time_now;
+            g_last_obstruction_time = time_now;
         }
     } else if (g_config.obst_from_status && cmd == GDO_CMD_PAIR_3_RESP) {
         if (byte1 == 0x0e) {
             ESP_LOGI(TAG, "Long duration obstruction detected");
-            obst_clear_from_status = true;
-            last_obstruction_time = time_now;
+            g_obst_clear_from_status = true;
+            g_last_obstruction_time = time_now;
         }
     } else {
         ESP_LOGD(TAG, "Unhandled command: %03x (%s)", cmd, cmd_to_string(cmd));
@@ -1670,7 +1771,6 @@ static void gdo_main_task(void* arg) {
                     // If not synced yet just delete the message as the sync loop will resend it
                     if (!g_status.synced) {
                         xQueueReceive(gdo_tx_queue, &tx_message, 0);
-                        free(tx_message.packet);
                         break;
                     }
 
@@ -1692,8 +1792,6 @@ static void gdo_main_task(void* arg) {
                             err = transmit_packet(tx_message.packet);
                         } while (err != ESP_OK && --retry_count);
                     }
-
-                    free(tx_message.packet);
                 } else {
                     ESP_LOGE(TAG, "TX queue empty, no message to send.");
                     err = ESP_ERR_INVALID_ARG;
@@ -1871,7 +1969,7 @@ static void update_door_state(const gdo_door_state_t door_state) {
  * @param type The type of paired devices to get the total for.
 */
 static void get_paired_devices(gdo_paired_device_type_t type) {
-    if (type >= GDO_PAIRED_DEVICE_TYPE_MAX) {
+    if ((int)type < 0 || type >= GDO_PAIRED_DEVICE_TYPE_MAX) {
         ESP_LOGE(TAG, "Invalid paired device type");
         return;
     }
@@ -1905,10 +2003,15 @@ inline static esp_err_t send_door_action(gdo_door_action_t action) {
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_DOOR_PRESS);
     } else {
+        uint32_t rolling_code = g_status.rolling_code;
         err = queue_command(GDO_CMD_DOOR_ACTION, action, 1, 1);
         if (err == ESP_OK) {
-            --g_status.rolling_code; // only increment after the second command
+            uint32_t next_rolling_code = g_status.rolling_code;
+            g_status.rolling_code = rolling_code;
             err = queue_command(GDO_CMD_DOOR_ACTION, action, 0, 1);
+            if (err != ESP_OK) {
+                g_status.rolling_code = next_rolling_code;
+            }
         }
     }
 
@@ -1953,10 +2056,8 @@ inline static void update_obstruction_state(gdo_obstruction_state_t obstruction_
     }
 
     ESP_LOGD(TAG, "Obstruction state: %s", gdo_obstruction_state_to_string(obstruction_state));
-    if (obstruction_state != g_status.obstruction) {
-        g_status.obstruction = obstruction_state;
-        queue_event((gdo_event_t){GDO_EVENT_OBST});
-    }
+    g_status.obstruction = obstruction_state;
+    queue_event((gdo_event_t){GDO_EVENT_OBST});
 }
 
 /**
@@ -2086,7 +2187,10 @@ inline static void update_motion_state(gdo_motion_state_t motion_state) {
 */
 inline static void update_openings(uint8_t flag, uint16_t count) {
     ESP_LOGD(TAG, "Openings: %u", count);
-    if (flag == 0 || g_status.openings != 0) {
+    if (flag == 0) {
+        g_openings_known = true;
+    }
+    if (g_openings_known) {
         if (g_status.openings != count) {
             g_status.openings = count;
             queue_event((gdo_event_t){GDO_EVENT_OPENINGS_UPDATE});

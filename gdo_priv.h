@@ -133,7 +133,7 @@ typedef struct {
 typedef struct {
     gdo_command_t cmd;
     uint32_t sent_ms;
-    uint8_t *packet;
+    uint8_t packet[19];
 } gdo_tx_message_t;
 
 typedef struct {
@@ -142,11 +142,13 @@ typedef struct {
     uint8_t nibble;
     uint8_t byte1;
     uint8_t byte2;
+    uint32_t generation;
     esp_timer_handle_t timer;
 } gdo_sched_cmd_args_t;
 
 typedef struct {
     gdo_event_type_t event;
+    uint32_t generation;
     esp_timer_handle_t timer;
 } gdo_sched_evt_args_t;
 

@@ -47,7 +47,7 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         break;
     case GDO_CB_EVENT_DOOR_POSITION:
         ESP_LOGI(TAG, "Door: %s, %.2f%%, target: %.2f%%", gdo_door_state_to_string(status->door),
-                 (float)status->door_position, (float)status->door_target);
+                 status->door_position / 100.0f, status->door_target / 100.0f);
         break;
     case GDO_CB_EVENT_LEARN:
         ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
@@ -97,7 +97,17 @@ void app_main(void)
         .obst_in_pin = 5,
     };
 
-    gdo_init(&gdo_conf);
-    gdo_start(gdo_event_handler, NULL);
+    esp_err_t err = gdo_init(&gdo_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize GDO: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = gdo_start(gdo_event_handler, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start GDO: %s", esp_err_to_name(err));
+        gdo_deinit();
+        return;
+    }
     ESP_LOGI(TAG, "GDO started!");
 }
