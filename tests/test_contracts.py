@@ -159,7 +159,7 @@ class GdolibContracts(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertEqual(metadata["version"], "1.2.1")
+        self.assertEqual(metadata["version"], "1.3.0")
         self.assertIn("status->door_position / 100.0f", example)
         self.assertIn("esp_err_t err = gdo_init(&gdo_conf);", example)
         self.assertIn("err = gdo_start(gdo_event_handler, NULL);", example)
