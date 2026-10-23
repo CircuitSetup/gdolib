@@ -34,6 +34,7 @@ static void door_position_sync_timer_cb(void* arg);
 static void scheduled_cmd_timer_cb(void* arg);
 static void scheduled_event_timer_cb(void* arg);
 static void obst_timer_cb(void* arg);
+static void obst_verify_timer_cb(void* arg);
 static void get_paired_devices(gdo_paired_device_type_t type);
 static void update_light_state(gdo_light_state_t light_state);
 static void update_lock_state(gdo_lock_state_t lock_state);
@@ -108,6 +109,7 @@ static esp_timer_handle_t door_position_sync_timer;
 static esp_timer_handle_t obst_timer;
 static esp_timer_handle_t v1_status_timer;
 static gdo_obstruction_stats_t g_obstruction_stats;
+static esp_timer_handle_t obst_verify_timer;
 static void *g_user_cb_arg;
 static uint32_t g_tx_delay_ms = 50;
 static uint32_t g_driver_generation;
@@ -150,6 +152,18 @@ static const uint32_t OBST_EDGE_DEBOUNCE_MS = 750;
 static const uint32_t OBST_STATUS_CLEAR_GUARD_MS = 5000;
 // Suppress exactly one clear-edge OBST_1 after an authoritative 0x09 clear.
 static const uint32_t OBST_TRAILING_EDGE_WINDOW_MS = 1000;
+
+// Minimum spacing between GET_STATUS requests sent to recover from a misaligned Sec+ v2
+// RX stream. Each request spends a rolling code, so a burst of line noise must not turn
+// into a burst of transmissions.
+static const uint32_t RX_RESYNC_STATUS_INTERVAL_MS = 3000;
+// While "obstructed", poll STATUS this long after the last trip and keep polling until it
+// reads clear. Every other repair path waits for a frame the opener sends unprompted, and
+// the opener transmits nothing while idle -- so a desync (a dropped or coalesced OBST_1
+// edge, a missing 0x09) would otherwise stick at "obstructed" until the next door move or
+// a reboot. Longer than both the ~4.4s STATUS lag and OBST_STATUS_CLEAR_GUARD_MS, so the
+// reply carries the current beam state and its "clear" is accepted.
+static const uint32_t OBST_VERIFY_INTERVAL_MS = 6000;
 
 static void delete_timer(esp_timer_handle_t *timer) {
     if (!*timer) {
@@ -247,6 +261,17 @@ esp_err_t gdo_init(const gdo_config_t *config) {
         }
     }
 
+    if (g_config.obst_from_status) {
+        timer_args.callback = obst_verify_timer_cb;
+        timer_args.arg = NULL;
+        timer_args.dispatch_method = ESP_TIMER_TASK;
+        timer_args.name = "obst_verify_timer";
+        err = esp_timer_create(&timer_args, &obst_verify_timer);
+        if (err != ESP_OK) {
+            goto fail;
+        }
+    }
+
     // Begin in secplus protocol v1 as its the easiest to detect.
     uart_config_t uart_config = {
         .baud_rate  = 1200,
@@ -285,6 +310,7 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     return ESP_OK;
 
 fail:
+    delete_timer(&obst_verify_timer);
     delete_timer(&obst_timer);
     delete_timer(&door_position_sync_timer);
     delete_timer(&motion_detect_timer);
@@ -326,6 +352,7 @@ esp_err_t gdo_deinit(void) {
     }
 
     delete_timer(&v1_status_timer);
+    delete_timer(&obst_verify_timer);
     delete_timer(&obst_timer);
     delete_timer(&door_position_sync_timer);
     delete_timer(&motion_detect_timer);
@@ -1186,6 +1213,22 @@ static void motion_detect_timer_cb(void* arg) {
 }
 
 /**
+ * @brief Started when obstruction (from status) goes to obstructed. While still obstructed,
+ * requests a STATUS every OBST_VERIFY_INTERVAL_MS so a desynced "obstructed" is repaired
+ * even when the opener is idle and sending nothing. decode_packet applies the reply.
+*/
+static void obst_verify_timer_cb(void* arg) {
+    if (g_status.obstruction != GDO_OBSTRUCTION_STATE_OBSTRUCTED ||
+        g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        return;
+    }
+
+    ESP_LOGD(TAG, "Obstruction still set, requesting status to verify");
+    get_status();
+    esp_timer_start_once(obst_verify_timer, OBST_VERIFY_INTERVAL_MS * 1000);
+}
+
+/**
  * @brief This timer is started when the door starts moving and will queue an event of
  * `GDO_EVENT_DOOR_POSITION_UPDATE` every 500ms until the door stops.
 */
@@ -1664,8 +1707,28 @@ static void gdo_main_task(void* arg) {
     gdo_cb_event_t cb_event = GDO_CB_EVENT_MAX;
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
+    // Set when the Sec+ v2 RX stream was flushed to realign it after a framing error.
+    bool fetch_status = false;
+    uint32_t last_status_ms = 0;
 
     for (;;) {
+        // The flush may have dropped a frame; the opener normally retransmits it, but ask
+        // for status in case it didn't. Rate-limited since each request spends a rolling
+        // code, and skipped before sync since the sync task is already querying the opener.
+        if (fetch_status) {
+            fetch_status = false;
+            uint32_t now = esp_timer_get_time() / 1000;
+            if (g_status.synced && now - last_status_ms >= RX_RESYNC_STATUS_INTERVAL_MS) {
+                ESP_LOGW(TAG, "RX stream misaligned, flushed and requesting status");
+                err = get_status();
+                if (err == ESP_OK) {
+                    last_status_ms = now;
+                } else {
+                    ESP_LOGE(TAG, "Failed to request status after RX resync: %s", esp_err_to_name(err));
+                }
+            }
+        }
+
         if (xQueueReceive(gdo_event_queue, (void*)&event, (TickType_t)portMAX_DELAY)) {
             cb_event = GDO_CB_EVENT_MAX;
 
@@ -1728,18 +1791,33 @@ static void gdo_main_task(void* arg) {
                     }
 
                     while(rx_pending) {
-                        if (uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0) == GDO_PACKET_SIZE) {
+                        int bytes_read = uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0);
+                        if (bytes_read == GDO_PACKET_SIZE) {
                             // check for the GDO packet start (0x55 0x01 0x00)
                             if (memcmp(rx_buffer, "\x55\x01\x00", 3) != 0) {
                                 ESP_LOGE(TAG, "RX data signature error: 0x%02x%02x%02x", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
-                                rx_pending--;
-                                continue;
+                                // Every later read would straddle two frames; flush to land the
+                                // next one on a frame boundary.
+                                uart_flush_input(g_config.uart_num);
+                                rx_pending = 0;
+                                fetch_status = true;
+                                break;
                             }
 
                             print_buffer(g_status.protocol, rx_buffer, false);
                             decode_packet(rx_buffer);
+                        } else if (bytes_read > 0) {
+                            // Consumed part of a frame, so the next read would start mid-frame.
+                            ESP_LOGE(TAG, "RX short read, %d bytes, %u pending messages.", bytes_read, rx_pending);
+                            uart_flush_input(g_config.uart_num);
+                            rx_pending = 0;
+                            fetch_status = true;
+                            break;
                         } else {
-                            ESP_LOGE(TAG, "RX buffer read error, %u pending messages.", rx_pending);
+                            // Nothing buffered, so the stream is still aligned. rx_pending over-counts
+                            // when line noise produces extra breaks, or when transmit_packet() flushed
+                            // bytes whose UART events are still queued.
+                            ESP_LOGD(TAG, "RX buffer empty, %u pending messages.", rx_pending);
                         }
                         --rx_pending;
                     }
@@ -1753,34 +1831,32 @@ static void gdo_main_task(void* arg) {
                     }
 
                     rx_buf_index += bytes_read;
+                    uint8_t i = 0;
+                    while (i < rx_buf_index) {
+                        uint8_t pkt[2] = {rx_buffer[i], 0};
+                        if (pkt[0] <= V1_CMD_MIN || pkt[0] >= V1_CMD_MAX) {
+                            i++;
+                            continue;
+                        }
 
-                    if (rx_buf_index >= GDO_PACKET_SIZE) {
-                        uint8_t i = 0;
-                        bool odd = rx_buf_index % 2 != 0;
-                        if (odd) {
-                            if (rx_buffer[0] <= V1_CMD_MIN || rx_buffer[0] >= V1_CMD_MAX) {
-                                i = 1; // Skip first byte if it's not a valid command
-                            } else {
-                                // Decrement the buffer index so we don't over read the buffer in the loop
-                                --rx_buf_index;
+                        if (pkt[0] > V1_CMD_TOGGLE_MAX) { // Process command with response (two byte)
+                            if (i + 1 < rx_buf_index) {
+                                pkt[1] = rx_buffer[++i];
+                            } else { // Incomplete packet, stop here and wait for more data
+                                break;
                             }
                         }
 
-                        uint8_t pkt[2];
-                        for (; i < rx_buf_index; i += 2) {
-                            pkt[0] = rx_buffer[i];
-                            pkt[1] = rx_buffer[i + 1];
-                            print_buffer(g_status.protocol, pkt, false);
-                            decode_v1_packet(pkt);
-                        }
+                        i++;
+                        print_buffer(g_status.protocol, pkt, false);
+                        decode_v1_packet(pkt);
+                    }
 
-                        // if we decremented the buffer index then we need to move the last byte to the start
-                        if (odd && rx_buf_index % 2 == 0) {
-                            rx_buffer[0] = rx_buffer[rx_buf_index];
-                            rx_buf_index = 1;
-                        } else {
-                            rx_buf_index = 0;
-                        }
+                    if (i < rx_buf_index) { // There are still unprocessed bytes in the buffer
+                        memmove(rx_buffer, &rx_buffer[i], rx_buf_index - i);
+                        rx_buf_index -= i;
+                    } else {
+                        rx_buf_index = 0;
                     }
                 }
 
@@ -2030,6 +2106,11 @@ static void get_paired_devices(gdo_paired_device_type_t type) {
  * @brief Gets the current status of the GDO.
 */
 inline static esp_err_t get_status() {
+    // Security+ 1.0 has no status request: the wall panel (or the emulation timer) polls
+    // status. Like learn and clear-paired, this is a Security+ 2.0-only command.
+    if (g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     return queue_command(GDO_CMD_GET_STATUS, 0, 0, 0);
 }
 
@@ -2105,6 +2186,12 @@ inline static void update_obstruction_state(gdo_obstruction_state_t obstruction_
     ESP_LOGD(TAG, "Obstruction state: %s", gdo_obstruction_state_to_string(obstruction_state));
     g_status.obstruction = obstruction_state;
     queue_event((gdo_event_t){GDO_EVENT_OBST});
+
+    // (Re)start the verify poll from this trip, so its first STATUS lands past the lag.
+    if (obstruction_state == GDO_OBSTRUCTION_STATE_OBSTRUCTED && obst_verify_timer) {
+        esp_timer_stop(obst_verify_timer);
+        esp_timer_start_once(obst_verify_timer, OBST_VERIFY_INTERVAL_MS * 1000);
+    }
 }
 
 /**
