@@ -52,13 +52,18 @@ static void update_door_state(const gdo_door_state_t door_state);
 static void decode_packet(uint8_t *packet);
 static esp_err_t get_status();
 static esp_err_t get_openings();
-static esp_err_t send_door_action(gdo_door_action_t action);
+static esp_err_t send_door_action(gdo_door_action_t action, uint32_t motion_generation, bool stops_motion);
+static esp_err_t door_open(uint32_t motion_generation, bool timed);
+static esp_err_t door_close(uint32_t motion_generation);
+static esp_err_t door_toggle(uint32_t motion_generation);
 static esp_err_t transmit_packet(uint8_t *packet);
 static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2);
+static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2,
+                                      const gdo_motion_command_t *motion);
 static esp_err_t queue_v1_command(gdo_v1_command_t command);
 static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_us);
 static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us);
-static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd);
+static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd, const gdo_motion_command_t *motion);
 static esp_err_t queue_event(gdo_event_t event);
 static void delete_timer(esp_timer_handle_t *timer);
 
@@ -113,6 +118,12 @@ static esp_timer_handle_t obst_verify_timer;
 static void *g_user_cb_arg;
 static uint32_t g_tx_delay_ms = 50;
 static uint32_t g_driver_generation;
+static uint32_t g_motion_generation;
+static uint32_t g_motion_command_id;
+// A failed replacement must leave the accepted partial move's braking STOP usable.
+static uint32_t g_braking_generation;
+// Opener position feedback can lag an already transmitted timed/toggle start.
+static uint32_t g_started_motion_generation;
 // Last status-class obstruction update; anchors the stale STATUS-clear guard.
 static uint32_t g_last_obstruction_time;
 // Last real obstruction edge; kept separate because STATUS frames are asynchronous.
@@ -126,6 +137,38 @@ static bool g_obst_trailing_edge_pending;
 static bool g_obst_isr_registered;
 static bool g_uart_driver_installed;
 static portMUX_TYPE gdo_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
+// Only scheduled motion is cancelled; button releases and other delayed commands must still run.
+static uint32_t cancel_scheduled_door_commands(uint32_t generation) {
+    portENTER_CRITICAL(&gdo_spinlock);
+    if (generation == 0 || generation == g_motion_generation) {
+        if (++g_motion_generation == 0) ++g_motion_generation;
+    }
+    const uint32_t current = g_motion_generation;
+    portEXIT_CRITICAL(&gdo_spinlock);
+    return current;
+}
+
+static bool motion_command_is_current(uint32_t generation, bool brake) {
+    portENTER_CRITICAL(&gdo_spinlock);
+    const bool current = generation == g_motion_generation || (brake && generation == g_braking_generation);
+    portEXIT_CRITICAL(&gdo_spinlock);
+    return current;
+}
+
+static void finish_motion_command(uint32_t generation, esp_err_t err) {
+    portENTER_CRITICAL(&gdo_spinlock);
+    if (generation == g_motion_generation && err == ESP_OK) g_braking_generation = 0;
+    portEXIT_CRITICAL(&gdo_spinlock);
+    if (err != ESP_OK) cancel_scheduled_door_commands(generation);
+}
+
+static bool motion_start_transmitted(void) {
+    portENTER_CRITICAL(&gdo_spinlock);
+    const bool transmitted = g_started_motion_generation != 0;
+    portEXIT_CRITICAL(&gdo_spinlock);
+    return transmitted;
+}
 
 // Empirical offset added to the move-to-target STOP delay to compensate for the
 // difference between OPEN and STOP command latencies. Default 0; tune on the
@@ -405,6 +448,10 @@ esp_err_t gdo_deinit(void) {
     g_status.remote_id = 0;
     g_status.toggle_only = false;
     g_status.last_move_direction = GDO_DOOR_STATE_UNKNOWN;
+    portENTER_CRITICAL(&gdo_spinlock);
+    g_braking_generation = 0;
+    g_started_motion_generation = 0;
+    portEXIT_CRITICAL(&gdo_spinlock);
     g_openings_known = false;
     g_obst_confirmed = false;
     g_obst_trailing_edge_pending = false;
@@ -525,9 +572,17 @@ esp_err_t gdo_sync(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_open(void) {
+    const uint32_t generation = cancel_scheduled_door_commands(0);
+    const esp_err_t err = door_open(generation, false);
+    finish_motion_command(generation, err);
+    return err;
+}
+
+static esp_err_t door_open(uint32_t motion_generation, bool timed) {
     g_status.door_target = 0;
 
-    if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_OPEN) {
+    if (g_status.door == GDO_DOOR_STATE_OPENING ||
+        (g_status.door == GDO_DOOR_STATE_OPEN && !motion_start_transmitted())) {
         return ESP_OK;
     }
 
@@ -535,9 +590,12 @@ esp_err_t gdo_door_open(void) {
         // If the door is stopped and the last move was opening, then the toggle command will make the door close.
         // So we need to send a toggle command to stop, then toggle again to open.
         if (g_status.door == GDO_DOOR_STATE_STOPPED && g_status.last_move_direction == GDO_DOOR_STATE_OPENING) {
+            timed = true;
             gdo_sched_cmd_args_t args = {
                 .cmd = (uint32_t)GDO_DOOR_ACTION_TOGGLE,
                 .door_cmd = true,
+                .stops_motion = true,
+                .motion_generation = motion_generation,
             };
 
             esp_err_t err = schedule_command(&args, 500 * 1000);
@@ -545,16 +603,17 @@ esp_err_t gdo_door_open(void) {
                 return err;
             }
 
+            args.stops_motion = false;
             err = schedule_command(&args, 1000 * 1000);
             if (err != ESP_OK) {
                 return err;
             }
         }
 
-        return gdo_door_toggle();
+        return door_toggle(timed ? motion_generation : 0);
     }
 
-    return send_door_action(GDO_DOOR_ACTION_OPEN);
+    return send_door_action(GDO_DOOR_ACTION_OPEN, timed ? motion_generation : 0, false);
 }
 
 /**
@@ -562,17 +621,25 @@ esp_err_t gdo_door_open(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_close(void) {
+    const uint32_t generation = cancel_scheduled_door_commands(0);
+    const esp_err_t err = door_close(0);
+    finish_motion_command(generation, err);
+    return err;
+}
+
+static esp_err_t door_close(uint32_t motion_generation) {
     g_status.door_target = 10000;
 
-    if (g_status.door == GDO_DOOR_STATE_CLOSING || g_status.door == GDO_DOOR_STATE_CLOSED) {
+    if (g_status.door == GDO_DOOR_STATE_CLOSING ||
+        (g_status.door == GDO_DOOR_STATE_CLOSED && !motion_start_transmitted())) {
         return ESP_OK;
     }
 
     if (g_status.toggle_only) {
-        return gdo_door_toggle();
+        return door_toggle(motion_generation);
     }
 
-    return send_door_action(GDO_DOOR_ACTION_CLOSE);
+    return send_door_action(GDO_DOOR_ACTION_CLOSE, motion_generation, false);
 }
 
 /**
@@ -580,11 +647,14 @@ esp_err_t gdo_door_close(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_stop(void) {
-    if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
-        return send_door_action(GDO_DOOR_ACTION_STOP);
+    const bool start_transmitted = motion_start_transmitted();
+    const uint32_t generation = cancel_scheduled_door_commands(0);
+    esp_err_t err = ESP_OK;
+    if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING || start_transmitted) {
+        err = send_door_action(GDO_DOOR_ACTION_STOP, 0, false);
     }
-
-    return ESP_OK;
+    finish_motion_command(generation, err);
+    return err;
 }
 
 /**
@@ -592,11 +662,18 @@ esp_err_t gdo_door_stop(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_toggle(void) {
+    const uint32_t generation = cancel_scheduled_door_commands(0);
+    const esp_err_t err = door_toggle(0);
+    finish_motion_command(generation, err);
+    return err;
+}
+
+static esp_err_t door_toggle(uint32_t motion_generation) {
     if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
-        return gdo_door_stop();
+        return send_door_action(GDO_DOOR_ACTION_STOP, motion_generation, false);
     }
 
-    return send_door_action(GDO_DOOR_ACTION_TOGGLE);
+    return send_door_action(GDO_DOOR_ACTION_TOGGLE, motion_generation, false);
 }
 
 /**
@@ -630,6 +707,8 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
     int32_t abs_delta = delta < 0 ? -delta : delta;
 
     if ((uint32_t)abs_delta < MOVE_TO_TARGET_NEAR_THRESHOLD) {
+        err = gdo_door_stop();
+        if (err != ESP_OK) return err;
         ESP_LOGI(TAG, "Move to target %.2f%% no-op: already within %.2f%% (current %.2f%%)",
                  target / 100.0f, MOVE_TO_TARGET_NEAR_THRESHOLD / 100.0f,
                  g_status.door_position / 100.0f);
@@ -681,6 +760,7 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
     gdo_sched_cmd_args_t args = {
         .cmd = (uint32_t)GDO_DOOR_ACTION_STOP,
         .door_cmd = true,
+        .motion_generation = cancel_scheduled_door_commands(0),
     };
     err = schedule_command(&args, stop_delay_ms * 1000);
     if (err != ESP_OK) {
@@ -693,9 +773,14 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
     // The clamp at update_door_state() only fires when target is in the
     // *opposite* direction of motion, so the partial target is preserved
     // through the OPENING/CLOSING transition.
-    err = opening ? gdo_door_open() : gdo_door_close();
+    err = opening ? door_open(args.motion_generation, true) : door_close(args.motion_generation);
     if (err == ESP_OK) {
         g_status.door_target = target;
+        portENTER_CRITICAL(&gdo_spinlock);
+        if (g_motion_generation == args.motion_generation) g_braking_generation = args.motion_generation;
+        portEXIT_CRITICAL(&gdo_spinlock);
+    } else {
+        cancel_scheduled_door_commands(args.motion_generation);
     }
     return err;
 }
@@ -712,7 +797,7 @@ esp_err_t gdo_light_on(void) {
     }
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS, NULL);
     }
 
     err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_ON, 0, 0);
@@ -735,7 +820,7 @@ esp_err_t gdo_light_off(void) {
     }
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS, NULL);
     }
 
     err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_OFF, 0, 0);
@@ -755,7 +840,7 @@ esp_err_t gdo_light_toggle(void) {
     esp_err_t err = ESP_OK;
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LIGHT_PRESS, NULL);
     }
 
     err = queue_command(GDO_CMD_LIGHT, GDO_LIGHT_ACTION_TOGGLE, 0, 0);
@@ -776,7 +861,7 @@ esp_err_t gdo_lock(void) {
     }
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS, NULL);
     }
 
     return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_LOCK, 0, 0);
@@ -792,7 +877,7 @@ esp_err_t gdo_unlock(void) {
     }
 
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS, NULL);
     }
 
     return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_UNLOCK, 0, 0);
@@ -805,7 +890,7 @@ esp_err_t gdo_unlock(void) {
 */
 esp_err_t gdo_toggle_lock(void) {
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_LOCK_PRESS, NULL);
     }
 
     return queue_command(GDO_CMD_LOCK, GDO_LOCK_ACTION_TOGGLE, 0, 0);
@@ -1274,11 +1359,11 @@ static void scheduled_cmd_timer_cb(void* arg) {
     gdo_sched_cmd_args_t *args = (gdo_sched_cmd_args_t*)arg;
 
     if (args->generation == g_driver_generation) {
-        if (args->door_cmd) {
+        if (args->door_cmd && motion_command_is_current(args->motion_generation, args->cmd == GDO_DOOR_ACTION_STOP)) {
             ESP_LOGI(TAG, "Scheduled door action %" PRIu32 " firing at %.2f%%",
                      args->cmd, g_status.door_position / 100.0f);
-            send_door_action((gdo_door_action_t)args->cmd);
-        } else {
+            send_door_action((gdo_door_action_t)args->cmd, args->motion_generation, args->stops_motion);
+        } else if (!args->door_cmd) {
             queue_command((gdo_command_t)args->cmd, args->nibble, args->byte1, args->byte2);
         }
     }
@@ -1408,8 +1493,8 @@ static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us) {
  * @param time_us The time in microseconds to send the command, must be more than 50 microseconds.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full.
 */
-static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd) {
-    esp_err_t err = queue_v1_command(cmd);
+static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd, const gdo_motion_command_t *motion) {
+    esp_err_t err = queue_motion_command((gdo_command_t)cmd, 0, 0, 0, motion);
     if (err == ESP_OK) {
         gdo_sched_cmd_args_t args = {
             .cmd = (uint32_t)cmd + 1, // release is always 1 higher than press
@@ -1441,6 +1526,11 @@ static esp_err_t queue_v1_command(gdo_v1_command_t command) {
  *  ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2) {
+    return queue_motion_command(command, nibble, byte1, byte2, NULL);
+}
+
+static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2,
+                                      const gdo_motion_command_t *motion) {
     if (!gdo_tx_queue || !gdo_event_queue) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -1449,6 +1539,7 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
         .cmd = command,
         .sent_ms = esp_timer_get_time() / 1000,
     };
+    if (motion) message.motion = *motion;
     bool secplus_v2 = g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2;
 
     // if we are here without a protocol defined then V1 testing failed, proceed with v2
@@ -1707,6 +1798,7 @@ static void gdo_main_task(void* arg) {
     gdo_cb_event_t cb_event = GDO_CB_EVENT_MAX;
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
+    uint32_t last_scheduled_door_press = 0;
     // Set when the Sec+ v2 RX stream was flushed to realign it after a framing error.
     bool fetch_status = false;
     uint32_t last_status_ms = 0;
@@ -1907,6 +1999,11 @@ static void gdo_main_task(void* arg) {
 
                 err = ESP_OK;
                 if (xQueueReceive(gdo_tx_queue, &tx_message, 0) == pdTRUE) {
+                    if (tx_message.motion.generation != 0 &&
+                        !motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) &&
+                        !(tx_message.motion.release && tx_message.motion.id == last_scheduled_door_press)) {
+                        break;
+                    }
                     if (now - tx_message.sent_ms > 3000) {
                         err = ESP_ERR_TIMEOUT;
                     } else {
@@ -1928,6 +2025,19 @@ static void gdo_main_task(void* arg) {
                     ESP_LOGD(TAG, "Sent command: %s", g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2 ?
                              cmd_to_string(tx_message.cmd) : v1_cmd_to_string(tx_message.cmd));
                     last_tx_time = esp_timer_get_time() / 1000;
+                    if (!tx_message.motion.release) {
+                        portENTER_CRITICAL(&gdo_spinlock);
+                        if (tx_message.motion.brake) {
+                            g_started_motion_generation = 0;
+                        } else if (tx_message.motion.generation != 0) {
+                            g_started_motion_generation = tx_message.motion.generation;
+                        }
+                        portEXIT_CRITICAL(&gdo_spinlock);
+                    }
+                    if (tx_message.motion.generation != 0) {
+                        // A superseding command must not leave a press already sent on the bus held down.
+                        last_scheduled_door_press = tx_message.motion.release ? 0 : tx_message.motion.id;
+                    }
                 }
 
                 break;
@@ -2005,6 +2115,14 @@ static void update_door_state(const gdo_door_state_t door_state) {
 
     if (door_state == g_status.door) {
         return;
+    }
+
+    if (door_state == GDO_DOOR_STATE_OPEN || door_state == GDO_DOOR_STATE_CLOSED ||
+        door_state == GDO_DOOR_STATE_STOPPED) {
+        portENTER_CRITICAL(&gdo_spinlock);
+        g_started_motion_generation = 0;
+        g_braking_generation = 0;
+        portEXIT_CRITICAL(&gdo_spinlock);
     }
 
     ESP_LOGD(TAG, "Door state: %s", gdo_door_state_to_string(door_state));
@@ -2126,17 +2244,26 @@ inline static esp_err_t get_openings() {
  * @param action The action to send to the GDO.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
-inline static esp_err_t send_door_action(gdo_door_action_t action) {
+inline static esp_err_t send_door_action(gdo_door_action_t action, uint32_t motion_generation, bool stops_motion) {
     esp_err_t err = ESP_OK;
+    gdo_motion_command_t motion = {.generation = motion_generation,
+                                   .brake = action == GDO_DOOR_ACTION_STOP || stops_motion};
+    if (motion_generation != 0) {
+        portENTER_CRITICAL(&gdo_spinlock);
+        if (++g_motion_command_id == 0) ++g_motion_command_id;
+        motion.id = g_motion_command_id;
+        portEXIT_CRITICAL(&gdo_spinlock);
+    }
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
-        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_DOOR_PRESS);
+        return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_DOOR_PRESS, &motion);
     } else {
         uint32_t rolling_code = g_status.rolling_code;
-        err = queue_command(GDO_CMD_DOOR_ACTION, action, 1, 1);
+        err = queue_motion_command(GDO_CMD_DOOR_ACTION, action, 1, 1, &motion);
         if (err == ESP_OK) {
             uint32_t next_rolling_code = g_status.rolling_code;
             g_status.rolling_code = rolling_code;
-            err = queue_command(GDO_CMD_DOOR_ACTION, action, 0, 1);
+            motion.release = true;
+            err = queue_motion_command(GDO_CMD_DOOR_ACTION, action, 0, 1, &motion);
             if (err != ESP_OK) {
                 g_status.rolling_code = next_rolling_code;
             }
