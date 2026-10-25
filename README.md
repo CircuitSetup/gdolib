@@ -2,6 +2,8 @@
 
 Garage door opener library for controlling security+ version 1.0 and 2.0 garage door openers for ESP32 microcontrollers.
 
+Door commands supersede earlier timed moves and delayed toggle sequences. A failed replacement preserves the previous partial move's safety stop. Stop cancels a timed start that has not reached the UART, and stops an already transmitted timed start even when opener state feedback is still pending. Required button releases continue after cancellation.
+
 
 ## Prerequisities:
 * ESP-IDF v4.4+

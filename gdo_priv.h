@@ -132,18 +132,28 @@ typedef struct {
 } gdo_obstruction_stats_t;
 
 typedef struct {
+    uint32_t generation;
+    uint32_t id;
+    bool release;
+    bool brake;
+} gdo_motion_command_t;
+
+typedef struct {
     gdo_command_t cmd;
     uint32_t sent_ms;
     uint8_t packet[19];
+    gdo_motion_command_t motion;
 } gdo_tx_message_t;
 
 typedef struct {
     uint32_t cmd;
     bool door_cmd;
+    bool stops_motion;
     uint8_t nibble;
     uint8_t byte1;
     uint8_t byte2;
     uint32_t generation;
+    uint32_t motion_generation;
     esp_timer_handle_t timer;
 } gdo_sched_cmd_args_t;
 
