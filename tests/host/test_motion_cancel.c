@@ -260,6 +260,100 @@ static void test_superseded_timer_command_is_discarded_after_enqueue(void) {
     CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 0);
 }
 
+static void partial_close(void) {
+    start_v2();
+    CHECK_EQ(gdo_set_open_duration(10000), ESP_OK);
+    CHECK_EQ(gdo_set_close_duration(10000), ESP_OK);
+    opener_sends(0, GDO_DOOR_STATE_OPEN);
+    run();
+    CHECK_EQ(gdo_door_move_to_target(5000), ESP_OK);
+    opener_sends(1000, GDO_DOOR_STATE_CLOSING);
+}
+
+static void test_stop_cancels_pending_close_verification(void) {
+    partial_close();
+    add_step(6400)->before = stop_door;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    run();
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 0);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 0);
+}
+
+static void test_stop_cancels_pending_close_verify_reply(void) {
+    partial_close();
+    add_step(6600)->before = stop_door;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    run();
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 1);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 0);
+}
+
+static void test_open_cancels_recovery_stop(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    add_step(8400)->before = open_door;
+    wait_until(11000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 2);
+    CHECK_EQ(g_status.door_target, 0);
+}
+
+static void supersede_recovery_reverse(QueueHandle_t queue, const void *item) {
+    on_queue_send(queue, item);
+    if (queue == gdo_tx_queue && last_queued(GDO_CMD_DOOR_ACTION)->nibble == GDO_DOOR_ACTION_OPEN) {
+        fake_on_queue_send = on_queue_send;
+        CHECK_EQ(gdo_door_stop(), ESP_OK);
+    }
+}
+
+static void test_stop_cancels_queued_recovery_reverse(void) {
+    partial_close();
+    fake_on_queue_send = supersede_recovery_reverse;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    wait_until(8000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 0);
+}
+
+static void fail_replacement_open(void) {
+    while (gdo_light_toggle() == ESP_OK) {}
+    CHECK_EQ(gdo_door_open(), ESP_ERR_NO_MEM);
+    xQueueReset(gdo_tx_queue);
+    xQueueReset(gdo_event_queue);
+}
+
+static void test_failed_replacement_keeps_close_recovery_and_target(void) {
+    partial_close();
+    add_step(6600)->before = fail_replacement_open;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(11000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 2);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+    CHECK_EQ(g_status.door_target, 5000);
+}
+
+static void fill_queue_after_recovery_press(QueueHandle_t queue, const void *item) {
+    on_queue_send(queue, item);
+    if (queue == gdo_tx_queue && last_queued(GDO_CMD_DOOR_ACTION)->nibble == GDO_DOOR_ACTION_OPEN) {
+        fake_on_queue_send = on_queue_send;
+        while (gdo_light_toggle() == ESP_OK) {}
+    }
+}
+
+static void test_recovery_release_failure_keeps_recovery_stop(void) {
+    partial_close();
+    fake_on_queue_send = fill_queue_after_recovery_press;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(11000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 1);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+}
+
 RUN_TESTS(
     TEST(test_stop_then_open_cancels_old_position_stop),
     TEST(test_full_open_cancels_position_stop_while_already_opening),
@@ -278,5 +372,11 @@ RUN_TESTS(
     TEST(test_near_noop_cancels_untransmitted_v1_move_and_its_stop),
     TEST(test_close_replaces_transmitted_open_before_feedback),
     TEST(test_open_replaces_transmitted_close_before_feedback),
-    TEST(test_superseded_timer_command_is_discarded_after_enqueue)
+    TEST(test_superseded_timer_command_is_discarded_after_enqueue),
+    TEST(test_stop_cancels_pending_close_verification),
+    TEST(test_stop_cancels_pending_close_verify_reply),
+    TEST(test_open_cancels_recovery_stop),
+    TEST(test_stop_cancels_queued_recovery_reverse),
+    TEST(test_failed_replacement_keeps_close_recovery_and_target),
+    TEST(test_recovery_release_failure_keeps_recovery_stop)
 )
