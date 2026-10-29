@@ -190,10 +190,14 @@ static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
 static const uint32_t MOVE_TO_TARGET_CLOSE_STOP_VERIFY_MS = 1500;
 // Measured STOP command-to-stop latency.
 static const uint32_t MOVE_TO_TARGET_STOP_LATENCY_MS = 1050;
+// Bound recovery intent when the opener never confirms the reversal.
+static const uint32_t MOVE_TO_TARGET_REVERSE_TIMEOUT_MS = 5000;
 static bool g_close_stop_verifying;
 static bool g_close_reversing;
 static uint32_t g_close_stop_generation;
 static uint32_t g_close_stop_target;
+static uint32_t g_close_reverse_id;
+static bool g_close_reverse_sent;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -449,6 +453,8 @@ esp_err_t gdo_deinit(void) {
     g_close_reversing = false;
     g_close_stop_generation = 0;
     g_close_stop_target = 0;
+    g_close_reverse_id = 0;
+    g_close_reverse_sent = false;
 
     g_protocol_forced = false;
     g_status.synced = false;
@@ -815,6 +821,8 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
             g_close_stop_target = target;
             g_close_stop_verifying = false;
             g_close_reversing = false;
+            g_close_reverse_id = 0;
+            g_close_reverse_sent = false;
             err = esp_timer_start_once(close_stop_verify_timer,
                                       (uint64_t)(stop_delay_ms + MOVE_TO_TARGET_CLOSE_STOP_VERIFY_MS) * 1000);
             if (err != ESP_OK) {
@@ -1399,14 +1407,24 @@ static bool clamp_to_partial_target(void) {
 }
 
 /**
- * @brief Started after a partial close's STOP. If the door still reads as closing, ask the
- * opener; decode_packet() reverses the door if the reply confirms it.
+ * @brief Verifies a partial close's STOP, then brakes if a commanded reversal is never confirmed.
+ * decode_packet() reverses the door only after a STATUS reply confirms it is still closing.
 */
 static void close_stop_verify_timer_cb(void* arg) {
-    if (g_status.door != GDO_DOOR_STATE_CLOSING ||
-        !motion_command_is_current(g_close_stop_generation, true)) {
+    if (!motion_command_is_current(g_close_stop_generation, true)) {
         return;
     }
+
+    if (g_close_reversing) {
+        g_close_reversing = false;
+        ESP_LOGW(TAG, "Reversal not confirmed; stopping recovery");
+        esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP, g_close_stop_generation, false);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to queue recovery timeout STOP: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+    if (g_status.door != GDO_DOOR_STATE_CLOSING) return;
 
     g_close_stop_verifying = true;
     get_status();
@@ -1780,10 +1798,17 @@ static bool decode_packet(uint8_t *packet) {
             ESP_LOGW(TAG, "Opener ignored STOP while closing; reversing to stop at %.2f%% on the way up",
                      g_close_stop_target / 100.0f);
             g_close_reversing = true;
+            g_close_reverse_sent = false;
             esp_err_t err = send_door_action(g_status.toggle_only ? GDO_DOOR_ACTION_TOGGLE : GDO_DOOR_ACTION_OPEN,
                                             g_close_stop_generation, true);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to reverse after ignored STOP: %s", esp_err_to_name(err));
+            }
+            esp_timer_stop(close_stop_verify_timer);
+            err = esp_timer_start_once(close_stop_verify_timer, (uint64_t)MOVE_TO_TARGET_REVERSE_TIMEOUT_MS * 1000);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to schedule reversal timeout: %s", esp_err_to_name(err));
+                close_stop_verify_timer_cb(NULL);
             }
         }
         g_close_stop_verifying = false;
@@ -2128,7 +2153,8 @@ static void gdo_main_task(void* arg) {
                 err = ESP_OK;
                 if (xQueueReceive(gdo_tx_queue, &tx_message, 0) == pdTRUE) {
                     if (tx_message.motion.generation != 0 &&
-                        !motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) &&
+                        (!motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) ||
+                         (tx_message.motion.id == g_close_reverse_id && !g_close_reversing)) &&
                         !(tx_message.motion.release && tx_message.motion.id == last_scheduled_door_press)) {
                         break;
                     }
@@ -2154,8 +2180,11 @@ static void gdo_main_task(void* arg) {
                              cmd_to_string(tx_message.cmd) : v1_cmd_to_string(tx_message.cmd));
                     last_tx_time = esp_timer_get_time() / 1000;
                     if (!tx_message.motion.release) {
+                        const bool recovery_reverse = tx_message.motion.id != 0 &&
+                                                      tx_message.motion.id == g_close_reverse_id;
+                        if (recovery_reverse) g_close_reverse_sent = true;
                         portENTER_CRITICAL(&gdo_spinlock);
-                        if (tx_message.motion.brake) {
+                        if (tx_message.motion.brake && !recovery_reverse) {
                             g_started_motion_generation = 0;
                         } else if (tx_message.motion.generation != 0) {
                             g_started_motion_generation = tx_message.motion.generation;
@@ -2245,25 +2274,30 @@ static void update_door_state(const gdo_door_state_t door_state) {
         return;
     }
 
+    const bool recovery_pending = g_close_reversing &&
+                                  motion_command_is_current(g_close_stop_generation, true);
+    const bool reverse_in_flight = recovery_pending && g_close_reverse_sent && door_state != GDO_DOOR_STATE_OPEN;
     if (door_state == GDO_DOOR_STATE_OPEN || door_state == GDO_DOOR_STATE_CLOSED ||
         door_state == GDO_DOOR_STATE_STOPPED) {
-        portENTER_CRITICAL(&gdo_spinlock);
-        g_started_motion_generation = 0;
-        g_braking_generation = 0;
-        portEXIT_CRITICAL(&gdo_spinlock);
+        // Terminal feedback can precede the effect of a reversal already sent on the bus.
+        if (!reverse_in_flight) {
+            portENTER_CRITICAL(&gdo_spinlock);
+            g_started_motion_generation = 0;
+            g_braking_generation = 0;
+            portEXIT_CRITICAL(&gdo_spinlock);
+        }
     }
 
     ESP_LOGD(TAG, "Door state: %s", gdo_door_state_to_string(door_state));
 
-    bool close_reversed = g_close_reversing && door_state == GDO_DOOR_STATE_OPENING &&
-                          motion_command_is_current(g_close_stop_generation, true);
+    bool close_reversed = recovery_pending && door_state == GDO_DOOR_STATE_OPENING;
     if (close_reversed) {
         // A failed replacement may have changed door_target; retain the original safety stop.
         g_status.door_target = g_close_stop_target;
     }
-    g_close_reversing = false;
+    if (!reverse_in_flight || close_reversed) g_close_reversing = false;
     if (door_state != GDO_DOOR_STATE_CLOSING) {
-        esp_timer_stop(close_stop_verify_timer);
+        if (!reverse_in_flight || close_reversed) esp_timer_stop(close_stop_verify_timer);
         g_close_stop_verifying = false;
     }
 
@@ -2308,14 +2342,15 @@ static void update_door_state(const gdo_door_state_t door_state) {
             }
         }
 
-        if (door_state == GDO_DOOR_STATE_OPENING && g_status.door_target >= g_status.door_position) {
+        if (door_state == GDO_DOOR_STATE_OPENING && g_status.door_target >= g_status.door_position && !close_reversed) {
             g_status.door_target = 0;
         } else if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door_target <= g_status.door_position) {
             g_status.door_target = 10000;
         }
 
-        if (close_reversed && g_status.door_target > 0 && g_status.door_target < g_status.door_position) {
-            uint32_t up_ms = (uint32_t)((g_status.door_position - g_status.door_target) / 10000.0f * g_status.open_ms);
+        if (close_reversed) {
+            int32_t remaining = g_status.door_position - g_status.door_target;
+            uint32_t up_ms = remaining > 0 ? (uint32_t)(remaining / 10000.0f * g_status.open_ms) : 0;
             uint32_t stop_delay_ms = up_ms > MOVE_TO_TARGET_STOP_LATENCY_MS ? up_ms - MOVE_TO_TARGET_STOP_LATENCY_MS : 1;
             ESP_LOGI(TAG, "Reversed at %.2f%%: STOP scheduled at +%" PRIu32 "ms",
                      g_status.door_position / 100.0f, stop_delay_ms);
@@ -2326,6 +2361,10 @@ static void update_door_state(const gdo_door_state_t door_state) {
             };
             if (schedule_command(&args, stop_delay_ms * 1000) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to schedule STOP after reversing");
+                esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP, g_close_stop_generation, false);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to queue immediate recovery STOP: %s", esp_err_to_name(err));
+                }
             }
         }
 
@@ -2416,6 +2455,9 @@ inline static esp_err_t send_door_action(gdo_door_action_t action, uint32_t moti
         if (++g_motion_command_id == 0) ++g_motion_command_id;
         motion.id = g_motion_command_id;
         portEXIT_CRITICAL(&gdo_spinlock);
+        if (stops_motion && g_close_reversing && motion_generation == g_close_stop_generation) {
+            g_close_reverse_id = motion.id;
+        }
     }
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_DOOR_PRESS, &motion);

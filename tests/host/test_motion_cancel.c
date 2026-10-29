@@ -354,6 +354,87 @@ static void test_recovery_release_failure_keeps_recovery_stop(void) {
     CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
 }
 
+static void hold_bus(void) { fake_gpio_level = 1; }
+static void release_bus(void) { fake_gpio_level = 0; }
+
+static void terminal_status_cancels_queued_reverse(gdo_door_state_t state) {
+    partial_close();
+    add_step(6600)->before = hold_bus;
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(6800, state);
+    add_step(7000)->before = release_bus;
+    wait_until(9000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 0);
+    CHECK_EQ(g_status.door, state);
+}
+
+static void test_stopped_cancels_queued_recovery_reverse(void) {
+    terminal_status_cancels_queued_reverse(GDO_DOOR_STATE_STOPPED);
+}
+
+static void test_closed_cancels_queued_recovery_reverse(void) {
+    terminal_status_cancels_queued_reverse(GDO_DOOR_STATE_CLOSED);
+}
+
+static void test_late_stopped_preserves_transmitted_recovery_stop(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(6720, GDO_DOOR_STATE_STOPPED);
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(11000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 2);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+}
+
+static void test_stop_after_late_stopped_brakes_transmitted_recovery(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(6720, GDO_DOOR_STATE_STOPPED);
+    add_step(7000)->before = stop_door;
+    wait_until(7400);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_OPEN), 2);
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+}
+
+static void test_full_open_finishes_recovery_without_opening_report(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(10000, GDO_DOOR_STATE_OPEN);
+    opener_sends(12000, GDO_DOOR_STATE_CLOSING);
+    opener_sends(16000, GDO_DOOR_STATE_OPENING);
+    wait_until(18000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 2);
+    CHECK_EQ(g_status.door_target, 0);
+}
+
+static void test_unconfirmed_reverse_expires_before_later_wall_motion(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    opener_sends(6720, GDO_DOOR_STATE_STOPPED);
+    wait_until(12000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+
+    opener_sends(20000, GDO_DOOR_STATE_OPENING);
+    wait_until(23000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+    CHECK_EQ(g_status.door_target, 0);
+}
+
+static void test_open_cancels_unconfirmed_reverse_timeout(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    add_step(7000)->before = open_door;
+    wait_until(13000);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 2);
+}
+
 RUN_TESTS(
     TEST(test_stop_then_open_cancels_old_position_stop),
     TEST(test_full_open_cancels_position_stop_while_already_opening),
@@ -378,5 +459,12 @@ RUN_TESTS(
     TEST(test_open_cancels_recovery_stop),
     TEST(test_stop_cancels_queued_recovery_reverse),
     TEST(test_failed_replacement_keeps_close_recovery_and_target),
-    TEST(test_recovery_release_failure_keeps_recovery_stop)
+    TEST(test_recovery_release_failure_keeps_recovery_stop),
+    TEST(test_stopped_cancels_queued_recovery_reverse),
+    TEST(test_closed_cancels_queued_recovery_reverse),
+    TEST(test_late_stopped_preserves_transmitted_recovery_stop),
+    TEST(test_stop_after_late_stopped_brakes_transmitted_recovery),
+    TEST(test_full_open_finishes_recovery_without_opening_report),
+    TEST(test_unconfirmed_reverse_expires_before_later_wall_motion),
+    TEST(test_open_cancels_unconfirmed_reverse_timeout)
 )

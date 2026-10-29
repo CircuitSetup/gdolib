@@ -312,6 +312,21 @@ static void test_move_to_target_close_stop_honored(void) {
     CHECK_EQ(g_status.door_position, 5000);
 }
 
+static void fail_next_timer(void) {
+    fake_timer_create_fail_after = 0;
+}
+
+static void test_recovery_stop_timer_failure_stops_immediately(void) {
+    start_partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    add_step(8240)->before = fail_next_timer;
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(8300);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(queued(GDO_CMD_DOOR_ACTION), 8);
+}
+
 /* The verify STATUS, not the stale local state, decides: a late STOPPED means no reverse. */
 static void test_move_to_target_late_close_stop_report_does_not_reverse(void) {
     start_partial_close();
@@ -389,6 +404,7 @@ RUN_TESTS(
     TEST(test_position_counts_travel_since_last_tick_on_stop),
     TEST(test_move_to_target_reverses_when_close_stop_is_ignored),
     TEST(test_move_to_target_close_stop_honored),
+    TEST(test_recovery_stop_timer_failure_stops_immediately),
     TEST(test_move_to_target_late_close_stop_report_does_not_reverse),
     TEST(test_move_to_target_full_close_is_never_reversed),
     TEST(test_position_tracks_through_direct_reversal),
