@@ -58,6 +58,7 @@ extern bool fake_log_enabled;
 
 /* ---- FreeRTOS ---- */
 typedef int BaseType_t;
+typedef uint32_t UBaseType_t;
 typedef uint32_t TickType_t;
 typedef void *TaskHandle_t;
 typedef struct fake_queue *QueueHandle_t;
@@ -81,6 +82,7 @@ BaseType_t xQueueSendToBack(QueueHandle_t q, const void *item, TickType_t ticks)
  * the never-returning gdo_main_task(). */
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t ticks);
 BaseType_t xQueueReset(QueueHandle_t q);
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q);
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, void *arg,
                        uint32_t prio, TaskHandle_t *handle);
 void vTaskDelete(TaskHandle_t task);

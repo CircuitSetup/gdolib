@@ -356,6 +356,31 @@ static void test_recovery_release_failure_keeps_recovery_stop(void) {
 
 static void hold_bus(void) { fake_gpio_level = 1; }
 static void release_bus(void) { fake_gpio_level = 0; }
+static void poll_status(void) { CHECK_EQ(get_status(), ESP_OK); }
+static void exhaust_timer_allocations(void) { fake_timer_create_fail_after = 0; }
+
+static void test_recovery_stop_transmits_when_pacing_timer_allocation_fails(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    add_step(8230)->before = poll_status;
+    add_step(8240)->before = exhaust_timer_allocations;
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(8500);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+}
+
+static void test_recovery_stop_transmits_after_collision_without_timer_allocations(void) {
+    partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    add_step(8230)->before = hold_bus;
+    add_step(8240)->before = exhaust_timer_allocations;
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    add_step(8400)->before = release_bus;
+    wait_until(8700);
+    run();
+    CHECK_EQ(transmitted_action(GDO_DOOR_ACTION_STOP), 4);
+}
 
 static void terminal_status_cancels_queued_reverse(gdo_door_state_t state) {
     partial_close();
@@ -466,5 +491,7 @@ RUN_TESTS(
     TEST(test_stop_after_late_stopped_brakes_transmitted_recovery),
     TEST(test_full_open_finishes_recovery_without_opening_report),
     TEST(test_unconfirmed_reverse_expires_before_later_wall_motion),
-    TEST(test_open_cancels_unconfirmed_reverse_timeout)
+    TEST(test_open_cancels_unconfirmed_reverse_timeout),
+    TEST(test_recovery_stop_transmits_when_pacing_timer_allocation_fails),
+    TEST(test_recovery_stop_transmits_after_collision_without_timer_allocations)
 )

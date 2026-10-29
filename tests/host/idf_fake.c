@@ -116,6 +116,8 @@ BaseType_t xQueueReset(QueueHandle_t q) {
     return pdPASS;
 }
 
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) { return q->count; }
+
 void fake_run_until_idle(void (*fn)(void *), void *arg) {
     if (setjmp(s_idle_jmp) == 0) {
         s_running = true;

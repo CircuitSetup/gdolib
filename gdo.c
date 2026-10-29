@@ -32,7 +32,6 @@ static void v1_status_timer_cb(void* arg);
 static void motion_detect_timer_cb(void* arg);
 static void door_position_sync_timer_cb(void* arg);
 static void scheduled_cmd_timer_cb(void* arg);
-static void scheduled_event_timer_cb(void* arg);
 static void obst_timer_cb(void* arg);
 static void obst_verify_timer_cb(void* arg);
 static void close_stop_verify_timer_cb(void* arg);
@@ -63,7 +62,6 @@ static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uin
                                       const gdo_motion_command_t *motion);
 static esp_err_t queue_v1_command(gdo_v1_command_t command);
 static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_us);
-static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us);
 static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd, const gdo_motion_command_t *motion);
 static esp_err_t queue_event(gdo_event_t event);
 static void delete_timer(esp_timer_handle_t *timer);
@@ -1480,22 +1478,6 @@ static void v1_status_timer_cb(void* arg) {
     }
 }
 
-/**
- * @brief This timer is started when an event is scheduled to be sent at a specific time.
- * When the timer expires it will send the event to the main event queue.
-*/
-static void scheduled_event_timer_cb(void* arg) {
-    gdo_sched_evt_args_t *args = (gdo_sched_evt_args_t*)arg;
-    if (args->generation == g_driver_generation &&
-        queue_event((gdo_event_t){args->event}) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to queue scheduled event");
-    }
-
-    // Event timers are one-shot, delete the timer and free the args.
-    esp_timer_delete(args->timer);
-    free(arg);
-}
-
 /******************************* COMMAND FUNCTIONS ************************************/
 
 /**
@@ -1536,46 +1518,6 @@ static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_
     if (err != ESP_OK) {
         esp_timer_delete(args->timer);
         free(args);
-    }
-
-    return err;
-}
-
-/**
- * @brief Creates a timer to send an event at a specific time.
- * @param event The event to send to the main event queue.
- * @param time_us The time in microseconds to send the event, must be more than 50 microseconds.
-*/
-static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us) {
-    esp_err_t err = ESP_OK;
-    if (time_us < 50) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    gdo_sched_evt_args_t *event_arg = (gdo_sched_evt_args_t*)malloc(sizeof(gdo_sched_evt_args_t));
-    if (!event_arg) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    event_arg->event = event;
-    event_arg->generation = g_driver_generation;
-    esp_timer_create_args_t timer_args = {
-        .callback = scheduled_event_timer_cb,
-        .arg = event_arg,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "scheduled_event_timer"
-    };
-
-    err = esp_timer_create(&timer_args, &event_arg->timer);
-    if (err != ESP_OK) {
-        free(event_arg);
-        return err;
-    }
-
-    err = esp_timer_start_once(event_arg->timer, time_us);
-    if (err != ESP_OK) {
-        esp_timer_delete(event_arg->timer);
-        free(event_arg);
     }
 
     return err;
@@ -1908,6 +1850,8 @@ static void gdo_main_task(void* arg) {
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
     uint32_t last_scheduled_door_press = 0;
+    // TX retries must remain possible when allocating a safety STOP timer has failed.
+    int64_t tx_retry_at = 0;
     // Set when the Sec+ v2 RX stream was flushed to realign it after a framing error.
     bool fetch_status = false;
     uint32_t last_status_ms = 0;
@@ -1971,7 +1915,19 @@ static void gdo_main_task(void* arg) {
             }
         }
 
-        if (xQueueReceive(gdo_event_queue, (void*)&event, wait)) {
+        if (tx_retry_at != 0) {
+            const int64_t remaining = tx_retry_at - esp_timer_get_time() / 1000;
+            TickType_t tx_wait = remaining > 0 ? pdMS_TO_TICKS(remaining) : 0;
+            if (remaining > 0 && tx_wait == 0) tx_wait = 1;
+            if (tx_wait < wait) wait = tx_wait;
+        }
+        bool received = xQueueReceive(gdo_event_queue, (void*)&event, wait);
+        if (!received && tx_retry_at != 0 && esp_timer_get_time() / 1000 >= tx_retry_at) {
+            event = (gdo_event_t){GDO_EVENT_TX_PENDING};
+            tx_retry_at = 0;
+            received = true;
+        }
+        if (received) {
             cb_event = GDO_CB_EVENT_MAX;
 
             switch ((int)event.gdo_event) {
@@ -2128,10 +2084,8 @@ static void gdo_main_task(void* arg) {
                 uint32_t now = esp_timer_get_time() / 1000;
                 if (now - last_tx_time < g_tx_delay_ms) {
                     ESP_LOGD(TAG, "TX pending, waiting, %" PRIu32 "ms since last TX", now - last_tx_time);
-                    err = schedule_event(GDO_EVENT_TX_PENDING,(g_tx_delay_ms - (now - last_tx_time)) * 1000);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to schedule TX pending event, %s", esp_err_to_name(err));
-                    }
+                    const int64_t retry_at = esp_timer_get_time() / 1000 + g_tx_delay_ms - (now - last_tx_time);
+                    if (tx_retry_at == 0 || retry_at < tx_retry_at) tx_retry_at = retry_at;
                     break;
                 }
 
@@ -2144,9 +2098,8 @@ static void gdo_main_task(void* arg) {
 
                     ESP_LOGD(TAG, "Collision detected, requeuing command");
                     // Wait 150ms for the collision to clear
-                    if (schedule_event(GDO_EVENT_TX_PENDING, 150 * 1000) != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to requeue command");
-                    }
+                    const int64_t retry_at = esp_timer_get_time() / 1000 + 150;
+                    if (tx_retry_at == 0 || retry_at < tx_retry_at) tx_retry_at = retry_at;
                     break;
                 }
 
@@ -2252,6 +2205,11 @@ static void gdo_main_task(void* arg) {
             if (cb_event < GDO_CB_EVENT_MAX && g_event_callback) {
                 g_event_callback(&g_status, cb_event, g_user_cb_arg);
             }
+        }
+        if (uxQueueMessagesWaiting(gdo_tx_queue) == 0) {
+            tx_retry_at = 0;
+        } else if (tx_retry_at == 0) {
+            tx_retry_at = esp_timer_get_time() / 1000 + 1;
         }
     }
 
