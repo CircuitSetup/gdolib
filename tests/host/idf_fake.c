@@ -21,11 +21,12 @@
 #include <string.h>
 
 bool fake_log_enabled;
+bool fake_queue_create_fail;
 int fake_timer_create_fail_after = -1;
 int fake_uart_flush_count;
 int fake_uart_frames_written;
 void (*fake_on_queue_send)(QueueHandle_t q, const void *item);
-bool (*fake_on_idle)(void);
+fake_idle_t (*fake_on_idle)(uint32_t until_ms);
 
 static uint32_t s_time_ms;
 static jmp_buf s_idle_jmp;
@@ -54,6 +55,7 @@ struct fake_queue {
 };
 
 QueueHandle_t xQueueCreate(uint32_t length, uint32_t item_size) {
+    if (fake_queue_create_fail) return NULL;
     QueueHandle_t q = calloc(1, sizeof(*q));
     q->length = length;
     q->item_size = item_size;
@@ -86,12 +88,21 @@ BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t ticks) {
 }
 
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t ticks) {
+    uint32_t until = ticks == portMAX_DELAY ? UINT32_MAX : s_time_ms + ticks;
     while (q->count == 0) {
-        if (ticks != portMAX_DELAY || !s_running) {
+        if (ticks == 0 || !s_running) {
             return pdFALSE;
         }
-        if (!fake_on_idle || !fake_on_idle()) {
+        fake_idle_t idle = fake_on_idle ? fake_on_idle(until) : FAKE_IDLE_DONE;
+        if (idle == FAKE_IDLE_DONE) {
             longjmp(s_idle_jmp, 1);
+        }
+        if (idle == FAKE_IDLE_NOT_YET) {
+            fake_advance_to(until);
+        }
+        // Like FreeRTOS, only report a timeout once the full wait has elapsed.
+        if (q->count == 0 && s_time_ms >= until) {
+            return pdFALSE;
         }
     }
     memcpy(item, q->items + q->head * q->item_size, q->item_size);
@@ -104,6 +115,8 @@ BaseType_t xQueueReset(QueueHandle_t q) {
     q->head = q->count = 0;
     return pdPASS;
 }
+
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) { return q->count; }
 
 void fake_run_until_idle(void (*fn)(void *), void *arg) {
     if (setjmp(s_idle_jmp) == 0) {
@@ -232,7 +245,8 @@ bool fake_timer_armed(esp_timer_handle_t t) { return esp_timer_is_active(t); }
 /* ---- gpio ---- */
 esp_err_t gpio_config(const gpio_config_t *cfg) { (void)cfg; return ESP_OK; }
 esp_err_t gpio_reset_pin(gpio_num_t pin) { (void)pin; return ESP_OK; }
-int gpio_get_level(gpio_num_t pin) { (void)pin; return 0; }
+int fake_gpio_level;
+int gpio_get_level(gpio_num_t pin) { (void)pin; return fake_gpio_level; }
 esp_err_t gpio_install_isr_service(int flags) { (void)flags; return ESP_OK; }
 esp_err_t gpio_isr_handler_add(gpio_num_t pin, void (*isr)(void *), void *arg) {
     (void)pin; (void)isr; (void)arg;
@@ -298,6 +312,7 @@ esp_err_t uart_flush(uart_port_t num) { return uart_flush_input(num); }
 
 /* ---- test controls ---- */
 void fake_reset(void) {
+    fake_queue_create_fail = false;
     fake_timer_create_fail_after = -1;
     s_rx_head = s_rx_len = 0;
     fake_uart_flush_count = 0;

@@ -32,9 +32,9 @@ static void v1_status_timer_cb(void* arg);
 static void motion_detect_timer_cb(void* arg);
 static void door_position_sync_timer_cb(void* arg);
 static void scheduled_cmd_timer_cb(void* arg);
-static void scheduled_event_timer_cb(void* arg);
 static void obst_timer_cb(void* arg);
 static void obst_verify_timer_cb(void* arg);
+static void close_stop_verify_timer_cb(void* arg);
 static void get_paired_devices(gdo_paired_device_type_t type);
 static void update_light_state(gdo_light_state_t light_state);
 static void update_lock_state(gdo_lock_state_t lock_state);
@@ -49,7 +49,7 @@ static void update_ttc(uint16_t ttc_seconds);
 static void update_paired_devices(gdo_paired_device_type_t type, uint8_t count);
 static void update_battery_state(gdo_battery_state_t battery_state);
 static void update_door_state(const gdo_door_state_t door_state);
-static void decode_packet(uint8_t *packet);
+static bool decode_packet(uint8_t *packet);
 static esp_err_t get_status();
 static esp_err_t get_openings();
 static esp_err_t send_door_action(gdo_door_action_t action, uint32_t motion_generation, bool stops_motion);
@@ -62,7 +62,6 @@ static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uin
                                       const gdo_motion_command_t *motion);
 static esp_err_t queue_v1_command(gdo_v1_command_t command);
 static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_us);
-static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us);
 static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd, const gdo_motion_command_t *motion);
 static esp_err_t queue_event(gdo_event_t event);
 static void delete_timer(esp_timer_handle_t *timer);
@@ -115,6 +114,7 @@ static esp_timer_handle_t obst_timer;
 static esp_timer_handle_t v1_status_timer;
 static gdo_obstruction_stats_t g_obstruction_stats;
 static esp_timer_handle_t obst_verify_timer;
+static esp_timer_handle_t close_stop_verify_timer;
 static void *g_user_cb_arg;
 static uint32_t g_tx_delay_ms = 50;
 static uint32_t g_driver_generation;
@@ -184,6 +184,18 @@ static const uint32_t MOVE_TO_TARGET_NEAR_THRESHOLD = 200;
 // dance is taken — that dance schedules toggles at +500ms and +1000ms before
 // motion starts, so STOP needs to be pushed out to align the motor pulse.
 static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
+// Some jackshaft openers ignore STOP while closing; verify it this long after sending.
+static const uint32_t MOVE_TO_TARGET_CLOSE_STOP_VERIFY_MS = 1500;
+// Measured STOP command-to-stop latency.
+static const uint32_t MOVE_TO_TARGET_STOP_LATENCY_MS = 1050;
+// Bound recovery intent when the opener never confirms the reversal.
+static const uint32_t MOVE_TO_TARGET_REVERSE_TIMEOUT_MS = 5000;
+static bool g_close_stop_verifying;
+static bool g_close_reversing;
+static uint32_t g_close_stop_generation;
+static uint32_t g_close_stop_target;
+static uint32_t g_close_reverse_id;
+static bool g_close_reverse_sent;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -207,6 +219,10 @@ static const uint32_t RX_RESYNC_STATUS_INTERVAL_MS = 3000;
 // a reboot. Longer than both the ~4.4s STATUS lag and OBST_STATUS_CLEAR_GUARD_MS, so the
 // reply carries the current beam state and its "clear" is accepted.
 static const uint32_t OBST_VERIFY_INTERVAL_MS = 6000;
+// A Sec+ v2 opener is silent while idle, so probe it with GET_STATUS after this long
+// without a frame, and resync if nothing arrives within the reply timeout.
+static const uint32_t HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+static const uint32_t HEARTBEAT_REPLY_TIMEOUT_MS = 2000;
 
 static void delete_timer(esp_timer_handle_t *timer) {
     if (!*timer) {
@@ -315,6 +331,15 @@ esp_err_t gdo_init(const gdo_config_t *config) {
         }
     }
 
+    timer_args.callback = close_stop_verify_timer_cb;
+    timer_args.arg = NULL;
+    timer_args.dispatch_method = ESP_TIMER_TASK;
+    timer_args.name = "close_stop_verify_timer";
+    err = esp_timer_create(&timer_args, &close_stop_verify_timer);
+    if (err != ESP_OK) {
+        goto fail;
+    }
+
     // Begin in secplus protocol v1 as its the easiest to detect.
     uart_config_t uart_config = {
         .baud_rate  = 1200,
@@ -353,6 +378,7 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     return ESP_OK;
 
 fail:
+    delete_timer(&close_stop_verify_timer);
     delete_timer(&obst_verify_timer);
     delete_timer(&obst_timer);
     delete_timer(&door_position_sync_timer);
@@ -395,6 +421,7 @@ esp_err_t gdo_deinit(void) {
     }
 
     delete_timer(&v1_status_timer);
+    delete_timer(&close_stop_verify_timer);
     delete_timer(&obst_verify_timer);
     delete_timer(&obst_timer);
     delete_timer(&door_position_sync_timer);
@@ -419,6 +446,13 @@ esp_err_t gdo_deinit(void) {
         g_uart_driver_installed = false;
     }
     gdo_event_queue = NULL;
+
+    g_close_stop_verifying = false;
+    g_close_reversing = false;
+    g_close_stop_generation = 0;
+    g_close_stop_target = 0;
+    g_close_reverse_id = 0;
+    g_close_reverse_sent = false;
 
     g_protocol_forced = false;
     g_status.synced = false;
@@ -779,6 +813,20 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
         portENTER_CRITICAL(&gdo_spinlock);
         if (g_motion_generation == args.motion_generation) g_braking_generation = args.motion_generation;
         portEXIT_CRITICAL(&gdo_spinlock);
+        if (!opening && g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+            esp_timer_stop(close_stop_verify_timer);
+            g_close_stop_generation = args.motion_generation;
+            g_close_stop_target = target;
+            g_close_stop_verifying = false;
+            g_close_reversing = false;
+            g_close_reverse_id = 0;
+            g_close_reverse_sent = false;
+            err = esp_timer_start_once(close_stop_verify_timer,
+                                      (uint64_t)(stop_delay_ms + MOVE_TO_TARGET_CLOSE_STOP_VERIFY_MS) * 1000);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to schedule close STOP verification: %s", esp_err_to_name(err));
+            }
+        }
     } else {
         cancel_scheduled_door_commands(args.motion_generation);
     }
@@ -1314,10 +1362,9 @@ static void obst_verify_timer_cb(void* arg) {
 }
 
 /**
- * @brief This timer is started when the door starts moving and will queue an event of
- * `GDO_EVENT_DOOR_POSITION_UPDATE` every 500ms until the door stops.
+ * @brief Advances the door position estimate by the travel since g_door_start_moving_ms.
 */
-static void door_position_sync_timer_cb(void* arg) {
+static void integrate_door_position(void) {
     int32_t duration = (esp_timer_get_time() / 1000) - g_door_start_moving_ms;
     float direction_ms = g_status.door == GDO_DOOR_STATE_OPENING ? -g_status.open_ms : g_status.close_ms;
     float delta = (duration / direction_ms) * 10000.0f;
@@ -1330,19 +1377,64 @@ static void door_position_sync_timer_cb(void* arg) {
     }
 
     g_door_start_moving_ms += duration;
+}
 
-    // For a partial-target move, clamp the estimate at the target and stop the timer.
-    // The motor keeps running until the scheduled STOP fires; letting the estimate
-    // sail past the target is what makes a small physical overshoot look like 10%.
-    bool partial_target_reached =
+/**
+ * @brief For a partial-target move, clamps the estimate at the target once it is reached.
+ * The motor keeps running until the scheduled STOP fires; letting the estimate sail past the
+ * target is what makes a small physical overshoot look like 10%.
+ * @return true if the target has been reached.
+*/
+static bool clamp_to_partial_target(void) {
+    bool reached =
         (g_status.door == GDO_DOOR_STATE_OPENING &&
          g_status.door_target > 0 && g_status.door_position <= g_status.door_target) ||
         (g_status.door == GDO_DOOR_STATE_CLOSING &&
          g_status.door_target < 10000 && g_status.door_position >= g_status.door_target);
 
-    if (partial_target_reached) {
+    if (reached) {
+        // Wind the time base back by the overshoot, so a reversal of a close the opener
+        // would not stop (see update_door_state) still knows how far past the target it went.
+        int32_t overshoot = g_status.door_position - g_status.door_target;
+        g_door_start_moving_ms -= (int32_t)((overshoot < 0 ? -overshoot : overshoot) / 10000.0f *
+                                            (g_status.door == GDO_DOOR_STATE_OPENING ? g_status.open_ms : g_status.close_ms));
         g_status.door_position = g_status.door_target;
     }
+
+    return reached;
+}
+
+/**
+ * @brief Verifies a partial close's STOP, then brakes if a commanded reversal is never confirmed.
+ * decode_packet() reverses the door only after a STATUS reply confirms it is still closing.
+*/
+static void close_stop_verify_timer_cb(void* arg) {
+    if (!motion_command_is_current(g_close_stop_generation, true)) {
+        return;
+    }
+
+    if (g_close_reversing) {
+        g_close_reversing = false;
+        ESP_LOGW(TAG, "Reversal not confirmed; stopping recovery");
+        esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP, g_close_stop_generation, false);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to queue recovery timeout STOP: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+    if (g_status.door != GDO_DOOR_STATE_CLOSING) return;
+
+    g_close_stop_verifying = true;
+    get_status();
+}
+
+/**
+ * @brief This timer is started when the door starts moving and will queue an event of
+ * `GDO_EVENT_DOOR_POSITION_UPDATE` every 500ms until the door stops.
+*/
+static void door_position_sync_timer_cb(void* arg) {
+    integrate_door_position();
+    bool partial_target_reached = clamp_to_partial_target();
 
     if (g_status.door_position == 0 || g_status.door_position == 10000 || partial_target_reached) {
         esp_timer_stop(door_position_sync_timer);
@@ -1386,22 +1478,6 @@ static void v1_status_timer_cb(void* arg) {
     }
 }
 
-/**
- * @brief This timer is started when an event is scheduled to be sent at a specific time.
- * When the timer expires it will send the event to the main event queue.
-*/
-static void scheduled_event_timer_cb(void* arg) {
-    gdo_sched_evt_args_t *args = (gdo_sched_evt_args_t*)arg;
-    if (args->generation == g_driver_generation &&
-        queue_event((gdo_event_t){args->event}) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to queue scheduled event");
-    }
-
-    // Event timers are one-shot, delete the timer and free the args.
-    esp_timer_delete(args->timer);
-    free(arg);
-}
-
 /******************************* COMMAND FUNCTIONS ************************************/
 
 /**
@@ -1442,46 +1518,6 @@ static esp_err_t schedule_command(gdo_sched_cmd_args_t *cmd_args, uint32_t time_
     if (err != ESP_OK) {
         esp_timer_delete(args->timer);
         free(args);
-    }
-
-    return err;
-}
-
-/**
- * @brief Creates a timer to send an event at a specific time.
- * @param event The event to send to the main event queue.
- * @param time_us The time in microseconds to send the event, must be more than 50 microseconds.
-*/
-static esp_err_t schedule_event(gdo_event_type_t event, uint32_t time_us) {
-    esp_err_t err = ESP_OK;
-    if (time_us < 50) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    gdo_sched_evt_args_t *event_arg = (gdo_sched_evt_args_t*)malloc(sizeof(gdo_sched_evt_args_t));
-    if (!event_arg) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    event_arg->event = event;
-    event_arg->generation = g_driver_generation;
-    esp_timer_create_args_t timer_args = {
-        .callback = scheduled_event_timer_cb,
-        .arg = event_arg,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "scheduled_event_timer"
-    };
-
-    err = esp_timer_create(&timer_args, &event_arg->timer);
-    if (err != ESP_OK) {
-        free(event_arg);
-        return err;
-    }
-
-    err = esp_timer_start_once(event_arg->timer, time_us);
-    if (err != ESP_OK) {
-        esp_timer_delete(event_arg->timer);
-        free(event_arg);
     }
 
     return err;
@@ -1666,8 +1702,9 @@ static void decode_v1_packet(uint8_t *packet) {
 /**
  * @brief Decodes a packet received from the GDO and updates the status.
  * @param packet The packet received from the GDO.
+ * @return true if the packet was a valid frame sent by another device on the bus.
 */
-static void decode_packet(uint8_t *packet) {
+static bool decode_packet(uint8_t *packet) {
     uint32_t rolling = 0;
     uint64_t fixed = 0;
     uint32_t data = 0;
@@ -1675,7 +1712,7 @@ static void decode_packet(uint8_t *packet) {
 
     if (decode_wireline(packet, &rolling, &fixed, &data) != 0) {
         ESP_LOGD(TAG, "Failed to decode wireline frame; dropping");
-        return;
+        return false;
     }
 
     data &= ~0xf000;
@@ -1683,7 +1720,7 @@ static void decode_packet(uint8_t *packet) {
     uint32_t remote_id = (uint32_t)(fixed & 0xFFFFFFFF);
     if (remote_id == g_status.client_id) { // my commands
         ESP_LOGE(TAG, "received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
-        return;
+        return false;
     } else {
         ESP_LOGI(TAG, "received rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
     }
@@ -1698,6 +1735,25 @@ static void decode_packet(uint8_t *packet) {
     ESP_LOGI(TAG, "cmd=%03x (%s) byte2=%02x byte1=%02x nibble=%01x", cmd, cmd_to_string(cmd), byte2, byte1, nibble);
 
     if (cmd == GDO_CMD_STATUS) {
+        if (g_close_stop_verifying && nibble == GDO_DOOR_STATE_CLOSING &&
+            motion_command_is_current(g_close_stop_generation, true)) {
+            ESP_LOGW(TAG, "Opener ignored STOP while closing; reversing to stop at %.2f%% on the way up",
+                     g_close_stop_target / 100.0f);
+            g_close_reversing = true;
+            g_close_reverse_sent = false;
+            esp_err_t err = send_door_action(g_status.toggle_only ? GDO_DOOR_ACTION_TOGGLE : GDO_DOOR_ACTION_OPEN,
+                                            g_close_stop_generation, true);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to reverse after ignored STOP: %s", esp_err_to_name(err));
+            }
+            esp_timer_stop(close_stop_verify_timer);
+            err = esp_timer_start_once(close_stop_verify_timer, (uint64_t)MOVE_TO_TARGET_REVERSE_TIMEOUT_MS * 1000);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to schedule reversal timeout: %s", esp_err_to_name(err));
+                close_stop_verify_timer_cb(NULL);
+            }
+        }
+        g_close_stop_verifying = false;
         update_door_state((gdo_door_state_t)nibble);
         update_light_state((gdo_light_state_t)((byte2 >> 1) & 1));
         update_lock_state((gdo_lock_state_t)(byte2 & 1));
@@ -1723,8 +1779,6 @@ static void decode_packet(uint8_t *packet) {
         }
     } else if (cmd == GDO_CMD_LIGHT) {
         handle_light_action((gdo_light_action_t)nibble);
-    } else if (cmd == GDO_CMD_MOTOR_ON) {
-        update_motor_state(GDO_MOTOR_STATE_ON);
     } else if (cmd == GDO_CMD_DOOR_ACTION) {
         update_button_state((gdo_button_state_t)((byte1 & 1) == 1) ?
                              GDO_BUTTON_STATE_PRESSED : GDO_BUTTON_STATE_RELEASED);
@@ -1739,11 +1793,6 @@ static void decode_packet(uint8_t *packet) {
     } else if (cmd == GDO_CMD_BATTERY_STATUS) {
         update_battery_state(byte1);
     } else if (cmd == GDO_CMD_OBST_1) {
-        if (g_status.door == GDO_DOOR_STATE_OPEN || g_status.door == GDO_DOOR_STATE_CLOSING) {
-            g_status.door = GDO_DOOR_STATE_OPEN; // if the obstruction sensor tripped the door will go back to open state.
-            queue_event((gdo_event_t){GDO_EVENT_DOOR_POSITION_UPDATE});
-        }
-
         /*
          * OBST_1 fires on both trip and clear with an identical payload, and is the
          * only fast signal for brief obstructions. Collapse retransmits, suppress the
@@ -1784,6 +1833,8 @@ static void decode_packet(uint8_t *packet) {
     } else {
         ESP_LOGD(TAG, "Unhandled command: %03x (%s)", cmd, cmd_to_string(cmd));
     }
+
+    return true;
 }
 
 /**
@@ -1799,9 +1850,14 @@ static void gdo_main_task(void* arg) {
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
     uint32_t last_scheduled_door_press = 0;
+    // TX retries must remain possible when allocating a safety STOP timer has failed.
+    int64_t tx_retry_at = 0;
     // Set when the Sec+ v2 RX stream was flushed to realign it after a framing error.
     bool fetch_status = false;
     uint32_t last_status_ms = 0;
+    uint32_t last_rx_ms = esp_timer_get_time() / 1000;
+    bool heartbeat_pending = false;
+    uint32_t heartbeat_ms = 0;
 
     for (;;) {
         // The flush may have dropped a frame; the opener normally retransmits it, but ask
@@ -1821,7 +1877,57 @@ static void gdo_main_task(void* arg) {
             }
         }
 
-        if (xQueueReceive(gdo_event_queue, (void*)&event, (TickType_t)portMAX_DELAY)) {
+        TickType_t wait = portMAX_DELAY;
+        if (g_status.synced && g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+            uint32_t now = esp_timer_get_time() / 1000;
+            if (!heartbeat_pending && now - last_rx_ms >= HEARTBEAT_INTERVAL_MS) {
+                ESP_LOGI(TAG, "Opener idle for %" PRIu32 "s, requesting status", (now - last_rx_ms) / 1000);
+                heartbeat_pending = true;
+                heartbeat_ms = now;
+                err = get_status();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to request heartbeat status: %s", esp_err_to_name(err));
+                }
+            }
+
+            if (heartbeat_pending && now - heartbeat_ms >= HEARTBEAT_REPLY_TIMEOUT_MS) {
+                ESP_LOGE(TAG, "No reply from the opener, resyncing");
+                heartbeat_pending = false;
+                // Breaks from a floating line are never followed by data, so this would
+                // otherwise stay non-zero and hold every sync command in the collision check.
+                rx_pending = 0;
+                g_status.synced = false;
+                g_status.door = GDO_DOOR_STATE_UNKNOWN;
+                g_status.openings = 0;
+                g_openings_known = false;
+                memset(&g_status.paired_devices, GDO_PAIRED_DEVICE_COUNT_UNKNOWN, sizeof(g_status.paired_devices));
+                err = gdo_sync();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to start resync: %s", esp_err_to_name(err));
+                }
+            } else {
+                uint32_t due = heartbeat_pending ? heartbeat_ms + HEARTBEAT_REPLY_TIMEOUT_MS
+                                                 : last_rx_ms + HEARTBEAT_INTERVAL_MS;
+                // Absolute deadlines, since a disconnected line reads as busy and the probe's
+                // 150ms collision retries keep the queue from ever going quiet. +1 so a
+                // sub-tick remainder doesn't spin on a zero timeout.
+                wait = pdMS_TO_TICKS(due - now) + 1;
+            }
+        }
+
+        if (tx_retry_at != 0) {
+            const int64_t remaining = tx_retry_at - esp_timer_get_time() / 1000;
+            TickType_t tx_wait = remaining > 0 ? pdMS_TO_TICKS(remaining) : 0;
+            if (remaining > 0 && tx_wait == 0) tx_wait = 1;
+            if (tx_wait < wait) wait = tx_wait;
+        }
+        bool received = xQueueReceive(gdo_event_queue, (void*)&event, wait);
+        if (!received && tx_retry_at != 0 && esp_timer_get_time() / 1000 >= tx_retry_at) {
+            event = (gdo_event_t){GDO_EVENT_TX_PENDING};
+            tx_retry_at = 0;
+            received = true;
+        }
+        if (received) {
             cb_event = GDO_CB_EVENT_MAX;
 
             switch ((int)event.gdo_event) {
@@ -1897,7 +2003,10 @@ static void gdo_main_task(void* arg) {
                             }
 
                             print_buffer(g_status.protocol, rx_buffer, false);
-                            decode_packet(rx_buffer);
+                            if (decode_packet(rx_buffer)) {
+                                last_rx_ms = esp_timer_get_time() / 1000;
+                                heartbeat_pending = false;
+                            }
                         } else if (bytes_read > 0) {
                             // Consumed part of a frame, so the next read would start mid-frame.
                             ESP_LOGE(TAG, "RX short read, %d bytes, %u pending messages.", bytes_read, rx_pending);
@@ -1975,10 +2084,8 @@ static void gdo_main_task(void* arg) {
                 uint32_t now = esp_timer_get_time() / 1000;
                 if (now - last_tx_time < g_tx_delay_ms) {
                     ESP_LOGD(TAG, "TX pending, waiting, %" PRIu32 "ms since last TX", now - last_tx_time);
-                    err = schedule_event(GDO_EVENT_TX_PENDING,(g_tx_delay_ms - (now - last_tx_time)) * 1000);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to schedule TX pending event, %s", esp_err_to_name(err));
-                    }
+                    const int64_t retry_at = esp_timer_get_time() / 1000 + g_tx_delay_ms - (now - last_tx_time);
+                    if (tx_retry_at == 0 || retry_at < tx_retry_at) tx_retry_at = retry_at;
                     break;
                 }
 
@@ -1991,16 +2098,16 @@ static void gdo_main_task(void* arg) {
 
                     ESP_LOGD(TAG, "Collision detected, requeuing command");
                     // Wait 150ms for the collision to clear
-                    if (schedule_event(GDO_EVENT_TX_PENDING, 150 * 1000) != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to requeue command");
-                    }
+                    const int64_t retry_at = esp_timer_get_time() / 1000 + 150;
+                    if (tx_retry_at == 0 || retry_at < tx_retry_at) tx_retry_at = retry_at;
                     break;
                 }
 
                 err = ESP_OK;
                 if (xQueueReceive(gdo_tx_queue, &tx_message, 0) == pdTRUE) {
                     if (tx_message.motion.generation != 0 &&
-                        !motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) &&
+                        (!motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) ||
+                         (tx_message.motion.id == g_close_reverse_id && !g_close_reversing)) &&
                         !(tx_message.motion.release && tx_message.motion.id == last_scheduled_door_press)) {
                         break;
                     }
@@ -2026,8 +2133,11 @@ static void gdo_main_task(void* arg) {
                              cmd_to_string(tx_message.cmd) : v1_cmd_to_string(tx_message.cmd));
                     last_tx_time = esp_timer_get_time() / 1000;
                     if (!tx_message.motion.release) {
+                        const bool recovery_reverse = tx_message.motion.id != 0 &&
+                                                      tx_message.motion.id == g_close_reverse_id;
+                        if (recovery_reverse) g_close_reverse_sent = true;
                         portENTER_CRITICAL(&gdo_spinlock);
-                        if (tx_message.motion.brake) {
+                        if (tx_message.motion.brake && !recovery_reverse) {
                             g_started_motion_generation = 0;
                         } else if (tx_message.motion.generation != 0) {
                             g_started_motion_generation = tx_message.motion.generation;
@@ -2096,6 +2206,11 @@ static void gdo_main_task(void* arg) {
                 g_event_callback(&g_status, cb_event, g_user_cb_arg);
             }
         }
+        if (uxQueueMessagesWaiting(gdo_tx_queue) == 0) {
+            tx_retry_at = 0;
+        } else if (tx_retry_at == 0) {
+            tx_retry_at = esp_timer_get_time() / 1000 + 1;
+        }
     }
 
     vTaskDelete(NULL);
@@ -2117,15 +2232,32 @@ static void update_door_state(const gdo_door_state_t door_state) {
         return;
     }
 
+    const bool recovery_pending = g_close_reversing &&
+                                  motion_command_is_current(g_close_stop_generation, true);
+    const bool reverse_in_flight = recovery_pending && g_close_reverse_sent && door_state != GDO_DOOR_STATE_OPEN;
     if (door_state == GDO_DOOR_STATE_OPEN || door_state == GDO_DOOR_STATE_CLOSED ||
         door_state == GDO_DOOR_STATE_STOPPED) {
-        portENTER_CRITICAL(&gdo_spinlock);
-        g_started_motion_generation = 0;
-        g_braking_generation = 0;
-        portEXIT_CRITICAL(&gdo_spinlock);
+        // Terminal feedback can precede the effect of a reversal already sent on the bus.
+        if (!reverse_in_flight) {
+            portENTER_CRITICAL(&gdo_spinlock);
+            g_started_motion_generation = 0;
+            g_braking_generation = 0;
+            portEXIT_CRITICAL(&gdo_spinlock);
+        }
     }
 
     ESP_LOGD(TAG, "Door state: %s", gdo_door_state_to_string(door_state));
+
+    bool close_reversed = recovery_pending && door_state == GDO_DOOR_STATE_OPENING;
+    if (close_reversed) {
+        // A failed replacement may have changed door_target; retain the original safety stop.
+        g_status.door_target = g_close_stop_target;
+    }
+    if (!reverse_in_flight || close_reversed) g_close_reversing = false;
+    if (door_state != GDO_DOOR_STATE_CLOSING) {
+        if (!reverse_in_flight || close_reversed) esp_timer_stop(close_stop_verify_timer);
+        g_close_stop_verifying = false;
+    }
 
     if (!g_status.open_ms) {
         if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
@@ -2156,17 +2288,42 @@ static void update_door_state(const gdo_door_state_t door_state) {
     }
 
     if (door_state == GDO_DOOR_STATE_OPENING || door_state == GDO_DOOR_STATE_CLOSING) {
+        update_motor_state(GDO_MOTOR_STATE_ON);
         if (g_status.door_position >= 0 && g_status.close_ms > 0 && g_status.open_ms > 0) {
+            if (g_door_start_moving_ms) { // reversed without stopping first
+                integrate_door_position();
+            }
             g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            esp_timer_stop(door_position_sync_timer);
             if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to start door position sync timer");
             }
         }
 
-        if (door_state == GDO_DOOR_STATE_OPENING && g_status.door_target >= g_status.door_position) {
+        if (door_state == GDO_DOOR_STATE_OPENING && g_status.door_target >= g_status.door_position && !close_reversed) {
             g_status.door_target = 0;
         } else if (door_state == GDO_DOOR_STATE_CLOSING && g_status.door_target <= g_status.door_position) {
             g_status.door_target = 10000;
+        }
+
+        if (close_reversed) {
+            int32_t remaining = g_status.door_position - g_status.door_target;
+            uint32_t up_ms = remaining > 0 ? (uint32_t)(remaining / 10000.0f * g_status.open_ms) : 0;
+            uint32_t stop_delay_ms = up_ms > MOVE_TO_TARGET_STOP_LATENCY_MS ? up_ms - MOVE_TO_TARGET_STOP_LATENCY_MS : 1;
+            ESP_LOGI(TAG, "Reversed at %.2f%%: STOP scheduled at +%" PRIu32 "ms",
+                     g_status.door_position / 100.0f, stop_delay_ms);
+            gdo_sched_cmd_args_t args = {
+                .cmd = (uint32_t)GDO_DOOR_ACTION_STOP,
+                .door_cmd = true,
+                .motion_generation = g_close_stop_generation,
+            };
+            if (schedule_command(&args, stop_delay_ms * 1000) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to schedule STOP after reversing");
+                esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP, g_close_stop_generation, false);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to queue immediate recovery STOP: %s", esp_err_to_name(err));
+                }
+            }
         }
 
         g_status.last_move_direction = door_state;
@@ -2176,6 +2333,9 @@ static void update_door_state(const gdo_door_state_t door_state) {
         if (door_state == GDO_DOOR_STATE_STOPPED) {
             if (g_status.door_position < 0) {
                 ESP_LOGW(TAG, "Unknown door position");
+            } else if (g_door_start_moving_ms) { // count the travel since the last 500ms tick
+                integrate_door_position();
+                clamp_to_partial_target();
             }
         } else if (door_state == GDO_DOOR_STATE_OPEN) {
             g_status.door_position = 0;
@@ -2191,7 +2351,7 @@ static void update_door_state(const gdo_door_state_t door_state) {
         }
 
         g_door_start_moving_ms = 0;
-        g_status.motor = GDO_MOTOR_STATE_OFF;
+        update_motor_state(GDO_MOTOR_STATE_OFF);
         g_status.door_target = g_status.door_position;
     }
 
@@ -2253,6 +2413,9 @@ inline static esp_err_t send_door_action(gdo_door_action_t action, uint32_t moti
         if (++g_motion_command_id == 0) ++g_motion_command_id;
         motion.id = g_motion_command_id;
         portEXIT_CRITICAL(&gdo_spinlock);
+        if (stops_motion && g_close_reversing && motion_generation == g_close_stop_generation) {
+            g_close_reverse_id = motion.id;
+        }
     }
     if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
         return gdo_v1_toggle_cmd(V1_CMD_TOGGLE_DOOR_PRESS, &motion);

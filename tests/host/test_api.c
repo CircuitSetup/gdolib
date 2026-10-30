@@ -102,6 +102,31 @@ static void test_get_status_snapshots(void) {
     CHECK_EQ(status.protocol, GDO_PROTOCOL_SEC_PLUS_V2);
 }
 
+static void test_failed_close_verify_timer_init_cleans_up_and_can_retry(void) {
+    fake_timer_create_fail_after = 2;
+    CHECK_EQ(gdo_init(&k_config), ESP_ERR_NO_MEM);
+    CHECK(motion_detect_timer == NULL);
+    CHECK(door_position_sync_timer == NULL);
+    CHECK(close_stop_verify_timer == NULL);
+
+    fake_timer_create_fail_after = -1;
+    CHECK_EQ(gdo_init(&k_config), ESP_OK);
+    CHECK_EQ(gdo_deinit(), ESP_OK);
+}
+
+static void test_failed_queue_init_cleans_up_close_verify_timer(void) {
+    fake_queue_create_fail = true;
+    CHECK_EQ(gdo_init(&k_config), ESP_ERR_NO_MEM);
+    CHECK(close_stop_verify_timer == NULL);
+    CHECK(motion_detect_timer == NULL);
+    CHECK(door_position_sync_timer == NULL);
+
+    fake_queue_create_fail = false;
+    CHECK_EQ(gdo_init(&k_config), ESP_OK);
+    CHECK_EQ(gdo_deinit(), ESP_OK);
+    CHECK(close_stop_verify_timer == NULL);
+}
+
 /* ---------------------------------------------------------------- setters */
 
 static void test_set_protocol(void) {
@@ -212,6 +237,141 @@ static void test_move_to_target_opens_then_stops(void) {
     CHECK(!fake_timer_armed(door_position_sync_timer));
 }
 
+/* A stop landing between 500ms ticks still counts the travel since the last one. */
+static void test_position_counts_travel_since_last_tick_on_stop(void) {
+    start_v2();
+    CHECK_EQ(gdo_set_open_duration(10000), ESP_OK);
+    CHECK_EQ(gdo_set_close_duration(10000), ESP_OK);
+    opener_sends(0, GDO_DOOR_STATE_CLOSED);
+    opener_sends(1000, GDO_DOOR_STATE_OPENING);
+    opener_sends(3250, GDO_DOOR_STATE_STOPPED);
+    run();
+    CHECK_EQ(g_status.door_position, 7750);
+    CHECK_EQ(g_status.door_target, 7750);
+}
+
+/* Door open (0), both durations 10s, partial close to 5000: CLOSE now, STOP at +5000ms. */
+static void start_partial_close(void) {
+    start_v2();
+    CHECK_EQ(gdo_set_open_duration(10000), ESP_OK);
+    CHECK_EQ(gdo_set_close_duration(10000), ESP_OK);
+    opener_sends(0, GDO_DOOR_STATE_OPEN);
+    run();
+    s_queued_count = 0;
+
+    CHECK_EQ(gdo_door_move_to_target(5000), ESP_OK);
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_CLOSE);
+    opener_sends(1000, GDO_DOOR_STATE_CLOSING);
+}
+
+/* Some openers (a jackshaft on the bench) ignore STOP while closing and only reverse. */
+static void test_move_to_target_reverses_when_close_stop_is_ignored(void) {
+    start_partial_close();
+    wait_until(6400);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 0);
+
+    wait_until(6600); // verify timer at +6500 asks the opener rather than trusting a late report
+    run();
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 1);
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING); // still closing: reverse
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_OPEN);
+    CHECK_EQ(g_status.door_target, 5000);
+
+    // Closed for 7250ms, so the door is 2250 past the target: 2250ms back up, less the
+    // STOP latency, puts the STOP at +1200ms.
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    run();
+    CHECK(g_status.door_position >= 7200 && g_status.door_position <= 7300);
+    CHECK_EQ(g_status.door_target, 5000);
+
+    wait_until(9400);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_OPEN);
+    wait_until(9500);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+
+    opener_sends(10500, GDO_DOOR_STATE_STOPPED);
+    run();
+    CHECK_EQ(g_status.door_position, 5000);
+    CHECK_EQ(queued(GDO_CMD_DOOR_ACTION), 8); // CLOSE, STOP, OPEN, STOP (press + release each)
+}
+
+static void test_move_to_target_close_stop_honored(void) {
+    start_partial_close();
+    opener_sends(6100, GDO_DOOR_STATE_STOPPED);
+    wait_until(9000);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 0);
+    CHECK_EQ(g_status.door_position, 5000);
+}
+
+static void fail_next_timer(void) {
+    fake_timer_create_fail_after = 0;
+}
+
+static void test_recovery_stop_timer_failure_stops_immediately(void) {
+    start_partial_close();
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    add_step(8240)->before = fail_next_timer;
+    opener_sends(8250, GDO_DOOR_STATE_OPENING);
+    wait_until(8300);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(queued(GDO_CMD_DOOR_ACTION), 8);
+}
+
+/* The verify STATUS, not the stale local state, decides: a late STOPPED means no reverse. */
+static void test_move_to_target_late_close_stop_report_does_not_reverse(void) {
+    start_partial_close();
+    wait_until(6600);
+    run();
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 1);
+
+    opener_sends(6700, GDO_DOOR_STATE_STOPPED);
+    wait_until(9000);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(queued(GDO_CMD_DOOR_ACTION), 4); // CLOSE, STOP only
+}
+
+/* A STATUS that happens to say CLOSING later, for a close the user asked for, must not
+ * be mistaken for the verify reply. */
+static void test_move_to_target_full_close_is_never_reversed(void) {
+    start_partial_close();
+    wait_until(6600);
+    run();
+    CHECK_EQ(queued(GDO_CMD_GET_STATUS), 1);
+
+    CHECK_EQ(gdo_door_close(), ESP_OK); // already closing: just retargets to fully closed
+    opener_sends(6700, GDO_DOOR_STATE_CLOSING);
+    run();
+    CHECK_EQ(last_queued(GDO_CMD_DOOR_ACTION)->nibble, GDO_DOOR_ACTION_STOP);
+    CHECK_EQ(g_status.door_target, 10000);
+}
+
+/* Reversing without a STOPPED in between keeps the travel since the last position tick. */
+static void test_position_tracks_through_direct_reversal(void) {
+    start_v2();
+    CHECK_EQ(gdo_set_open_duration(10000), ESP_OK);
+    CHECK_EQ(gdo_set_close_duration(10000), ESP_OK);
+    opener_sends(0, GDO_DOOR_STATE_OPEN);
+    opener_sends(1000, GDO_DOOR_STATE_CLOSING);
+    opener_sends(4250, GDO_DOOR_STATE_OPENING); // 3250 closed, 250 of it since the last tick
+    run();
+    CHECK_EQ(g_status.door_position, 3250);
+
+    wait_until(4800); // ticks restart from the reversal
+    run();
+    CHECK_EQ(g_status.door_position, 2750);
+}
+
 static void test_move_to_target_rejects_tiny_moves(void) {
     start_v2();
     CHECK_EQ(gdo_set_open_duration(10000), ESP_OK);
@@ -232,6 +392,8 @@ RUN_TESTS(
     TEST(test_deinit_resets_state_and_allows_reinit),
     TEST(test_failed_verify_timer_init_cleans_up_and_can_retry),
     TEST(test_get_status_snapshots),
+    TEST(test_failed_close_verify_timer_init_cleans_up_and_can_retry),
+    TEST(test_failed_queue_init_cleans_up_close_verify_timer),
     TEST(test_set_protocol),
     TEST(test_persisted_rolling_code_and_client_id_are_used),
     TEST(test_duration_and_interval_validation),
@@ -239,5 +401,12 @@ RUN_TESTS(
     TEST(test_position_tracks_while_moving),
     TEST(test_move_to_target_validation),
     TEST(test_move_to_target_opens_then_stops),
+    TEST(test_position_counts_travel_since_last_tick_on_stop),
+    TEST(test_move_to_target_reverses_when_close_stop_is_ignored),
+    TEST(test_move_to_target_close_stop_honored),
+    TEST(test_recovery_stop_timer_failure_stops_immediately),
+    TEST(test_move_to_target_late_close_stop_report_does_not_reverse),
+    TEST(test_move_to_target_full_close_is_never_reversed),
+    TEST(test_position_tracks_through_direct_reversal),
     TEST(test_move_to_target_rejects_tiny_moves)
 )

@@ -58,6 +58,7 @@ extern bool fake_log_enabled;
 
 /* ---- FreeRTOS ---- */
 typedef int BaseType_t;
+typedef uint32_t UBaseType_t;
 typedef uint32_t TickType_t;
 typedef void *TaskHandle_t;
 typedef struct fake_queue *QueueHandle_t;
@@ -67,6 +68,7 @@ typedef int portMUX_TYPE;
 #define pdPASS  1
 #define portMAX_DELAY ((TickType_t)0xffffffffUL)
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+#define portTICK_PERIOD_MS 1
 #define portMUX_INITIALIZER_UNLOCKED 0
 #define portENTER_CRITICAL(mux) ((void)(mux))
 #define portEXIT_CRITICAL(mux) ((void)(mux))
@@ -80,6 +82,7 @@ BaseType_t xQueueSendToBack(QueueHandle_t q, const void *item, TickType_t ticks)
  * the never-returning gdo_main_task(). */
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t ticks);
 BaseType_t xQueueReset(QueueHandle_t q);
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q);
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, void *arg,
                        uint32_t prio, TaskHandle_t *handle);
 void vTaskDelete(TaskHandle_t task);
@@ -122,6 +125,8 @@ typedef struct {
 esp_err_t gpio_config(const gpio_config_t *cfg);
 esp_err_t gpio_reset_pin(gpio_num_t pin);
 int gpio_get_level(gpio_num_t pin);
+/* What gpio_get_level() returns for every pin; 1 on the RX pin reads as a busy line. */
+extern int fake_gpio_level;
 esp_err_t gpio_install_isr_service(int flags);
 esp_err_t gpio_isr_handler_add(gpio_num_t pin, void (*isr)(void *), void *arg);
 esp_err_t gpio_isr_handler_remove(gpio_num_t pin);
@@ -178,6 +183,7 @@ esp_err_t uart_flush_input(uart_port_t num);
 
 /* ---- test controls ---- */
 extern int fake_timer_create_fail_after; // -1 disables timer allocation failure injection
+extern bool fake_queue_create_fail;
 void fake_reset(void);
 void fake_set_time_ms(uint32_t ms);
 /* Moves the clock forward to ms, firing every armed esp_timer that falls due on the way, in
@@ -205,10 +211,17 @@ typedef struct {
 extern fake_tx_t fake_tx_log[FAKE_TX_LOG_MAX];
 extern int fake_tx_count;
 /* Runs fn (a never-returning task loop) until it blocks on an empty queue and fake_on_idle
- * (if set) declines to supply more work by returning false. */
+ * (if set) returns FAKE_IDLE_DONE. */
 void fake_run_until_idle(void (*fn)(void *), void *arg);
+typedef enum {
+    FAKE_IDLE_FED,      // supplied work at or before until_ms
+    FAKE_IDLE_NOT_YET,  // has work, but only after until_ms
+    FAKE_IDLE_DONE,     // has no more work
+} fake_idle_t;
+/* Called when a receive would block, with the time its timeout expires (UINT32_MAX for
+ * portMAX_DELAY). On NOT_YET the clock jumps to until_ms and the receive times out. */
+extern fake_idle_t (*fake_on_idle)(uint32_t until_ms);
 /* Called for every item successfully queued, so tests can observe e.g. queued commands. */
-extern bool (*fake_on_idle)(void);
 extern void (*fake_on_queue_send)(QueueHandle_t q, const void *item);
 
 #endif // IDF_FAKE_H
