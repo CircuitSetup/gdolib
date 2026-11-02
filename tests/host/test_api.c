@@ -56,6 +56,43 @@ static void test_calls_before_init_or_start_are_rejected(void) {
     CHECK_EQ(gdo_sync(), ESP_ERR_NOT_FINISHED);  // start already launched the sync task
 }
 
+static void test_init_pulls_rx_up_on_cold_boot_and_reinit(void) {
+    const int rx_pins[] = {2, 21};
+    for (unsigned i = 0; i < sizeof(rx_pins) / sizeof(rx_pins[0]); ++i) {
+        gdo_config_t config = k_config;
+        config.uart_rx_pin = rx_pins[i];
+        config.invert_uart = i == 0;
+        for (unsigned boot = 0; boot < 2; ++boot) {
+            fake_gpio_pullup[config.uart_rx_pin] = false;
+            fake_gpio_pulldown[config.uart_rx_pin] = boot != 0;
+            fake_gpio_pullup[config.uart_tx_pin] = false;
+            fake_gpio_pulldown[config.uart_tx_pin] = true;
+            CHECK_EQ(gdo_init(&config), ESP_OK);
+            CHECK(fake_gpio_pullup[config.uart_rx_pin]);
+            CHECK(!fake_gpio_pulldown[config.uart_rx_pin]);
+            CHECK(!fake_gpio_pullup[config.uart_tx_pin]);
+            CHECK(fake_gpio_pulldown[config.uart_tx_pin]);
+            CHECK_EQ(gdo_deinit(), ESP_OK);
+        }
+    }
+}
+
+static void test_failed_rx_pullup_init_cleans_up_and_can_retry(void) {
+    fake_gpio_set_pull_mode_result = ESP_FAIL;
+    CHECK_EQ(gdo_init(&k_config), ESP_FAIL);
+    CHECK(gdo_tx_queue == NULL);
+    CHECK(motion_detect_timer == NULL);
+    CHECK(door_position_sync_timer == NULL);
+    CHECK(close_stop_verify_timer == NULL);
+    CHECK(fake_gpio_pullup[k_config.uart_rx_pin]); // Failed init reset both UART pins.
+    CHECK(fake_gpio_pullup[k_config.uart_tx_pin]);
+    CHECK_EQ(gdo_start(record_cb, NULL), ESP_ERR_INVALID_STATE);
+
+    fake_gpio_set_pull_mode_result = ESP_OK;
+    CHECK_EQ(gdo_init(&k_config), ESP_OK);
+    CHECK_EQ(gdo_deinit(), ESP_OK);
+}
+
 static void test_deinit_resets_state_and_allows_reinit(void) {
     start_v2();
     opener_v2(0, GDO_CMD_STATUS, GDO_DOOR_STATE_OPEN, 0x40, 0x02);
@@ -388,6 +425,8 @@ static void test_move_to_target_rejects_tiny_moves(void) {
 
 RUN_TESTS(
     TEST(test_init_validates_and_rejects_double_init),
+    TEST(test_init_pulls_rx_up_on_cold_boot_and_reinit),
+    TEST(test_failed_rx_pullup_init_cleans_up_and_can_retry),
     TEST(test_calls_before_init_or_start_are_rejected),
     TEST(test_deinit_resets_state_and_allows_reinit),
     TEST(test_failed_verify_timer_init_cleans_up_and_can_retry),

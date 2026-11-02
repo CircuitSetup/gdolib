@@ -368,6 +368,12 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     }
     uart_pins_configured = true;
 
+    // Recent ESP-IDF UART drivers leave RX pulls unchanged, including after cold boot.
+    err = gpio_set_pull_mode(g_config.uart_rx_pin, GPIO_PULLUP_ONLY);
+    if (err != ESP_OK) {
+        goto fail;
+    }
+
     gdo_tx_queue = xQueueCreate(16, sizeof(gdo_tx_message_t));
     if (!gdo_tx_queue) {
         err = ESP_ERR_NO_MEM;

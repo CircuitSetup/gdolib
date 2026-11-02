@@ -244,7 +244,19 @@ bool fake_timer_armed(esp_timer_handle_t t) { return esp_timer_is_active(t); }
 
 /* ---- gpio ---- */
 esp_err_t gpio_config(const gpio_config_t *cfg) { (void)cfg; return ESP_OK; }
-esp_err_t gpio_reset_pin(gpio_num_t pin) { (void)pin; return ESP_OK; }
+bool fake_gpio_pullup[GPIO_NUM_MAX], fake_gpio_pulldown[GPIO_NUM_MAX];
+esp_err_t fake_gpio_set_pull_mode_result = ESP_OK;
+esp_err_t gpio_reset_pin(gpio_num_t pin) {
+    fake_gpio_pullup[pin] = true;
+    fake_gpio_pulldown[pin] = false;
+    return ESP_OK;
+}
+esp_err_t gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t mode) {
+    if (fake_gpio_set_pull_mode_result != ESP_OK) return fake_gpio_set_pull_mode_result;
+    fake_gpio_pullup[pin] = mode == GPIO_PULLUP_ONLY || mode == GPIO_PULLUP_PULLDOWN;
+    fake_gpio_pulldown[pin] = mode == GPIO_PULLDOWN_ONLY || mode == GPIO_PULLUP_PULLDOWN;
+    return ESP_OK;
+}
 int fake_gpio_level;
 int gpio_get_level(gpio_num_t pin) { (void)pin; return fake_gpio_level; }
 esp_err_t gpio_install_isr_service(int flags) { (void)flags; return ESP_OK; }

@@ -114,6 +114,7 @@ typedef int gpio_num_t;
 typedef enum { GPIO_MODE_INPUT = 1 } gpio_mode_t;
 typedef enum { GPIO_PULLUP_DISABLE = 0, GPIO_PULLUP_ENABLE } gpio_pullup_t;
 typedef enum { GPIO_PULLDOWN_DISABLE = 0, GPIO_PULLDOWN_ENABLE } gpio_pulldown_t;
+typedef enum { GPIO_PULLUP_ONLY, GPIO_PULLDOWN_ONLY, GPIO_PULLUP_PULLDOWN, GPIO_FLOATING } gpio_pull_mode_t;
 typedef enum { GPIO_INTR_DISABLE = 0, GPIO_INTR_NEGEDGE = 2 } gpio_int_type_t;
 typedef struct {
     uint64_t pin_bit_mask;
@@ -124,6 +125,9 @@ typedef struct {
 } gpio_config_t;
 esp_err_t gpio_config(const gpio_config_t *cfg);
 esp_err_t gpio_reset_pin(gpio_num_t pin);
+esp_err_t gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t mode);
+extern bool fake_gpio_pullup[GPIO_NUM_MAX], fake_gpio_pulldown[GPIO_NUM_MAX];
+extern esp_err_t fake_gpio_set_pull_mode_result;
 int gpio_get_level(gpio_num_t pin);
 /* What gpio_get_level() returns for every pin; 1 on the RX pin reads as a busy line. */
 extern int fake_gpio_level;
