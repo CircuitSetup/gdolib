@@ -142,6 +142,7 @@ typedef struct {
     gdo_command_t cmd;
     uint32_t sent_ms;
     uint8_t packet[19];
+    bool secplus_v2;
     gdo_motion_command_t motion;
 } gdo_tx_message_t;
 

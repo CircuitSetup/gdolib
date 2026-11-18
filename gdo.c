@@ -56,7 +56,7 @@ static esp_err_t send_door_action(gdo_door_action_t action, uint32_t motion_gene
 static esp_err_t door_open(uint32_t motion_generation, bool timed);
 static esp_err_t door_close(uint32_t motion_generation);
 static esp_err_t door_toggle(uint32_t motion_generation);
-static esp_err_t transmit_packet(uint8_t *packet);
+static esp_err_t transmit_packet(const gdo_tx_message_t *message);
 static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2);
 static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uint8_t byte1, uint8_t byte2,
                                       const gdo_motion_command_t *motion);
@@ -102,6 +102,7 @@ static gdo_status_t g_status = {
 };
 
 static bool g_protocol_forced;
+static bool g_smart_panel_timed_out;
 static gdo_config_t g_config;
 static uint32_t g_door_start_moving_ms;
 static TaskHandle_t gdo_main_task_handle;
@@ -223,6 +224,8 @@ static const uint32_t OBST_VERIFY_INTERVAL_MS = 6000;
 // without a frame, and resync if nothing arrives within the reply timeout.
 static const uint32_t HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 static const uint32_t HEARTBEAT_REPLY_TIMEOUT_MS = 2000;
+
+static const uint32_t V1_SMART_PANEL_SYNC_TIMEOUT_MS = 5000;
 
 static void delete_timer(esp_timer_handle_t *timer) {
     if (!*timer) {
@@ -461,6 +464,7 @@ esp_err_t gdo_deinit(void) {
     g_close_reverse_sent = false;
 
     g_protocol_forced = false;
+    g_smart_panel_timed_out = false;
     g_status.synced = false;
     g_status.protocol = 0;
     g_status.door = GDO_DOOR_STATE_UNKNOWN;
@@ -1158,8 +1162,40 @@ static void gdo_sync_task(void* arg) {
         uart_flush(g_config.uart_num);
         xQueueReset(gdo_event_queue);
 
-        // Delay forever if there is a smart panel connected to allow it to come online and sync before we do anything.
-        ulTaskNotifyTake(pdTRUE, g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL ? portMAX_DELAY : pdMS_TO_TICKS(2500));
+        if (g_protocol_forced && g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL) {
+            const int64_t deadline = esp_timer_get_time() + V1_SMART_PANEL_SYNC_TIMEOUT_MS * 1000;
+            // A status arriving at timeout can complete sync on either task without notifying a deleted task.
+            for (;;) {
+                const int64_t remaining_us = deadline - esp_timer_get_time();
+                const bool expired = remaining_us <= 0;
+                portENTER_CRITICAL(&gdo_spinlock);
+                const bool found = g_status.door != GDO_DOOR_STATE_UNKNOWN;
+                const bool already_synced = g_status.synced;
+                if (found || expired) {
+                    g_smart_panel_timed_out = !found;
+                    if (found) {
+                        g_status.toggle_only = true;
+                        g_status.synced = true;
+                    }
+                    gdo_sync_task_handle = NULL;
+                }
+                portEXIT_CRITICAL(&gdo_spinlock);
+
+                if (found || expired) {
+                    if (!found) {
+                        ESP_LOGE(TAG, "Smart wall panel not detected within %" PRIu32 " ms", V1_SMART_PANEL_SYNC_TIMEOUT_MS);
+                    }
+                    if (!already_synced) queue_event((gdo_event_t){GDO_EVENT_SYNC_COMPLETE});
+                    vTaskDelete(NULL);
+                    return;
+                }
+                const uint32_t wait_ms = remaining_us > 50000 ? 50 : (remaining_us + 999) / 1000;
+                const TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+                vTaskDelay(wait_ticks ? wait_ticks : 1);
+            }
+        }
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2500));
 
         if (g_status.door == GDO_DOOR_STATE_UNKNOWN) {
             ESP_LOGW(TAG, "V1 panel not found, trying emulation");
@@ -1212,6 +1248,9 @@ static void gdo_sync_task(void* arg) {
     uart_set_parity(g_config.uart_num, UART_PARITY_DISABLE);
     uart_flush(g_config.uart_num);
     xQueueReset(gdo_event_queue);
+    if (uxQueueMessagesWaiting(gdo_tx_queue) != 0) {
+        queue_event((gdo_event_t){GDO_EVENT_TX_PENDING});
+    }
 
     for (;;) {
         if ((esp_timer_get_time() / 1000) > timeout) {
@@ -1577,15 +1616,15 @@ static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uin
         return ESP_ERR_INVALID_STATE;
     }
 
+    const gdo_protocol_type_t protocol = g_status.protocol;
     gdo_tx_message_t message = {
         .cmd = command,
         .sent_ms = esp_timer_get_time() / 1000,
+        .secplus_v2 = protocol == GDO_PROTOCOL_SEC_PLUS_V2,
     };
     if (motion) message.motion = *motion;
-    bool secplus_v2 = g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2;
 
-    // if we are here without a protocol defined then V1 testing failed, proceed with v2
-    if (secplus_v2) {
+    if (message.secplus_v2) {
         uint64_t cmd = command;
         uint64_t fixed = ((cmd & ~0xff) << 24) | g_status.client_id;
         uint32_t data = ((uint32_t)byte2 << 24) | ((uint32_t)byte1 << 16) |
@@ -1598,11 +1637,11 @@ static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uin
         message.packet[0] = command;
     }
 
-    print_buffer(g_status.protocol, message.packet, true);
+    print_buffer(protocol, message.packet, true);
     if (xQueueSendToBack(gdo_tx_queue, &message, 0) == pdFALSE) {
         return ESP_ERR_NO_MEM;
     }
-    if (secplus_v2) {
+    if (message.secplus_v2) {
         g_status.rolling_code = (g_status.rolling_code + 1U) & GDO_ROLLING_CODE_MAX;
     }
 
@@ -1611,13 +1650,13 @@ static esp_err_t queue_motion_command(gdo_command_t command, uint8_t nibble, uin
 
 /**
  * @brief Transmits a packet to the GDO from the UART.
- * @param packet The packet to send to the GDO.
+ * @param message The encoded message to send to the GDO.
  * @return ESP_OK on success, other non-zero errors from the UART driver.
 */
-static esp_err_t transmit_packet(uint8_t *packet) {
+static esp_err_t transmit_packet(const gdo_tx_message_t *message) {
     esp_err_t err = ESP_OK;
 
-    if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+    if (message->secplus_v2) {
         // The packet transmission needs to start with a break, which is a low signal for approximately 13 bit times.
         // Since the UART driver does not support a break signal, we set the baud rate to 6900  and write a single
         // byte of 0x00 to simulate the break. 8 data bits + 1 start bit = ~1305us of low time, then 144us time high for the stop.
@@ -1643,7 +1682,7 @@ static esp_err_t transmit_packet(uint8_t *packet) {
             return err;
         }
 
-        if (uart_write_bytes(g_config.uart_num, packet, GDO_PACKET_SIZE) < 0) {
+        if (uart_write_bytes(g_config.uart_num, message->packet, sizeof(message->packet)) < 0) {
             return ESP_FAIL;
         }
 
@@ -1657,7 +1696,7 @@ static esp_err_t transmit_packet(uint8_t *packet) {
         // flush the rx buffer since it will now have the data we just sent.
         err = uart_flush_input(g_config.uart_num);
     } else { // secplus v1, just send the byte
-        if (uart_write_bytes(g_config.uart_num, packet, 1) < 0) {
+        if (uart_write_bytes(g_config.uart_num, message->packet, 1) < 0) {
             return ESP_FAIL;
         }
     }
@@ -1690,7 +1729,9 @@ static void decode_v1_packet(uint8_t *packet) {
         }
         update_door_state(door_state);
     } else if (cmd == V1_CMD_QUERY_DOOR_STATUS_0x37) {
-        queue_v1_command(V1_CMD_QUERY_OTHER_STATUS);
+        if (!g_protocol_forced || g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL || g_status.synced) {
+            queue_v1_command(V1_CMD_QUERY_OTHER_STATUS);
+        }
     } else if (cmd == V1_CMD_QUERY_OTHER_STATUS) {
         update_light_state((gdo_light_state_t)((resp >> 2) & 1));
         update_lock_state((gdo_lock_state_t)((~resp >> 3) & 1));
@@ -2111,6 +2152,10 @@ static void gdo_main_task(void* arg) {
 
                 err = ESP_OK;
                 if (xQueueReceive(gdo_tx_queue, &tx_message, 0) == pdTRUE) {
+                    // Auto-detection can change the wire format with polls still queued.
+                    if (tx_message.secplus_v2 != (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2)) {
+                        break;
+                    }
                     if (tx_message.motion.generation != 0 &&
                         (!motion_command_is_current(tx_message.motion.generation, tx_message.motion.brake) ||
                          (tx_message.motion.id == g_close_reverse_id && !g_close_reversing)) &&
@@ -2122,7 +2167,7 @@ static void gdo_main_task(void* arg) {
                     } else {
                         uint8_t retry_count = 2;
                         do {
-                            err = transmit_packet(tx_message.packet);
+                            err = transmit_packet(&tx_message);
                         } while (err != ESP_OK && --retry_count);
                     }
                 } else {
@@ -2237,6 +2282,8 @@ static void update_door_state(const gdo_door_state_t door_state) {
     if (door_state == g_status.door) {
         return;
     }
+
+    const bool was_door_unknown = g_status.door == GDO_DOOR_STATE_UNKNOWN;
 
     const bool recovery_pending = g_close_reversing &&
                                   motion_command_is_current(g_close_stop_generation, true);
@@ -2367,13 +2414,25 @@ static void update_door_state(const gdo_door_state_t door_state) {
         g_status.door_target = g_status.door_position;
     }
 
-    if (g_status.door == GDO_DOOR_STATE_UNKNOWN &&
-        g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1 &&
-        gdo_sync_task_handle) {
+    portENTER_CRITICAL(&gdo_spinlock);
+    g_status.door = door_state;
+    const bool forced_smart_panel = g_protocol_forced && g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V1_WITH_SMART_PANEL;
+    const bool late_smart_panel = forced_smart_panel && g_smart_panel_timed_out && !g_status.synced;
+    if (late_smart_panel) {
+        g_status.toggle_only = true;
+        g_status.synced = true;
+        g_smart_panel_timed_out = false;
+    }
+    portEXIT_CRITICAL(&gdo_spinlock);
+
+    if (late_smart_panel) {
+        ESP_LOGI(TAG, "Smart wall panel found after sync timeout");
+        queue_event((gdo_event_t){GDO_EVENT_SYNC_COMPLETE});
+    } else if (!forced_smart_panel && was_door_unknown &&
+               (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) && gdo_sync_task_handle) {
         xTaskNotifyGive(gdo_sync_task_handle);
     }
 
-    g_status.door = door_state;
     queue_event((gdo_event_t){GDO_EVENT_DOOR_POSITION_UPDATE});
 }
 
