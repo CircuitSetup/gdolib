@@ -143,10 +143,55 @@ static void test_v1_busy_bus_stays_bounded_and_recovers(void) {
     CHECK(transmitted_count() - s_sent_after_recovery >= 18);
 }
 
+/* The collision check reads the raw RX pin, before the UART's own inversion. Idle is low
+ * with invert_uart set and high without, so a busy line is the opposite level. */
+static void release_collision(void) {
+    CHECK_EQ(transmitted_count(), 0);
+    CHECK_EQ(tx_queue_depth(), 2);
+    fake_gpio_level = !fake_gpio_level;
+}
+
+static void check_tx_waits_for_idle_line(bool inverted) {
+    start_gdo((gdo_test_opts_t){ .protocol = GDO_PROTOCOL_SEC_PLUS_V2, .synced = true,
+                                 .non_inverted_uart = !inverted });
+    int base = s_live_allocs;
+
+    fake_gpio_level = inverted;
+    CHECK_EQ(gdo_light_toggle(), ESP_OK); // LIGHT + GET_STATUS
+    add_step(1000)->before = release_collision;
+    wait_until(2000);
+    run();
+    CHECK_EQ(transmitted_count(), 2);
+    CHECK_EQ(tx_queue_depth(), 0);
+    CHECK_EQ(s_live_allocs - base, 0);
+}
+
+static void test_inverted_uart_waits_for_idle_line(void) {
+    check_tx_waits_for_idle_line(true);
+}
+
+static void test_non_inverted_uart_waits_for_idle_line(void) {
+    check_tx_waits_for_idle_line(false);
+}
+
+/* Before sync a busy line drops the packet instead of retrying. Without inversion that
+ * used to drop every packet, because the idle level read as busy. */
+static void test_non_inverted_idle_line_does_not_drop_unsynced_tx(void) {
+    start_gdo((gdo_test_opts_t){ .protocol = GDO_PROTOCOL_SEC_PLUS_V2, .synced = false,
+                                 .non_inverted_uart = true });
+    fake_gpio_level = 1;
+    CHECK_EQ(get_status(), ESP_OK);
+    run();
+    CHECK_EQ(transmitted_count(), 1);
+}
+
 RUN_TESTS(
     TEST(test_v2_queue_full_does_not_allocate),
     TEST(test_v1_queue_full_does_not_allocate),
     TEST(test_queued_packets_transmit_without_allocating),
     TEST(test_v1_poll_is_discarded_after_switch_to_v2),
-    TEST(test_v1_busy_bus_stays_bounded_and_recovers)
+    TEST(test_v1_busy_bus_stays_bounded_and_recovers),
+    TEST(test_inverted_uart_waits_for_idle_line),
+    TEST(test_non_inverted_uart_waits_for_idle_line),
+    TEST(test_non_inverted_idle_line_does_not_drop_unsynced_tx)
 )

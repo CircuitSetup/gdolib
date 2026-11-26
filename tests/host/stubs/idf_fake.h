@@ -129,7 +129,8 @@ esp_err_t gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t mode);
 extern bool fake_gpio_pullup[GPIO_NUM_MAX], fake_gpio_pulldown[GPIO_NUM_MAX];
 extern esp_err_t fake_gpio_set_pull_mode_result;
 int gpio_get_level(gpio_num_t pin);
-/* What gpio_get_level() returns for every pin; 1 on the RX pin reads as a busy line. */
+/* What gpio_get_level() returns for every pin. On the RX pin, 1 is a busy line with
+ * invert_uart set and an idle one without. */
 extern int fake_gpio_level;
 esp_err_t gpio_install_isr_service(int flags);
 esp_err_t gpio_isr_handler_add(gpio_num_t pin, void (*isr)(void *), void *arg);
